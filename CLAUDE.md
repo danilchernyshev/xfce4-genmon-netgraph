@@ -8,6 +8,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `xfce4-genmon-plugin`. There are two executables in `bin/` and no build step, package
 manager or test suite in the repo. Runtime deps: `python3-cairo`, `xfce4-genmon-plugin`, `iw`.
 
+**Work in progress:** the v1.0.0 release is being prepared. Before doing anything else in a new
+session, read `docs/RELEASE-CHECKLIST.md`, continue from its first unticked box, and tick the
+boxes as you go.
+
+The repo is public. Before every commit, check that no real SSIDs, MACs, IPs, usernames or
+emails go in. The docs use the placeholders `HomeNet`, `aa:bb:cc:dd:ee:0N` and `192.168.1.x`.
+
 ```bash
 ./install.sh                              # copies bin/* to ~/.local/bin (copies, not symlinks: re-run after every edit)
 python3 -m py_compile bin/panelgraph-daemon   # quick syntax check
