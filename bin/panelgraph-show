@@ -32,6 +32,9 @@ fi
 # true, not ":": a failed redirection on a special builtin exits dash, and the
 # 2> has to come first to swallow the message
 true 2>/dev/null > "$d/seen"
+# genmon execs us directly, so $PPID is its wrapper; the hover popup finds the panel
+# item's window through it (F-25, D-48). printf is a builtin; the 2> comes first as above.
+[ "$1" = net ] && printf '%s\n' "$PPID" 2>/dev/null > "$d/net.host"
 if [ -r "$d/$1.txt" ]; then
     while IFS= read -r line; do printf '%s\n' "$line"; done < "$d/$1.txt"
 else
