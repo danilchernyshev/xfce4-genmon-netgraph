@@ -55,7 +55,7 @@ The daemon was developed and deployed on Kali (`~/.local/bin`) before this repo 
 
 ## 5. Tag and release
 
-- [ ] Commit, push, tag and create the release:
+- [x] Commit, push, tag and create the release:
   ```bash
   git tag -a v1.0.0 -m "v1.0.0" && git push origin v1.0.0
   gh release create v1.0.0 --title "v1.0.0" \
