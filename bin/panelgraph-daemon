@@ -617,6 +617,9 @@ class IwRunner:
                     self._fail(self.key, "timeout", now)
                 return              # never start another until this one is reaped
             if not self.killed:
+                # iw may have written and exited after the drain above: read to EOF
+                # now, or a lost "Connected to" looks like "Not connected." (D-57)
+                self._drain()
                 self._finish(now)
             try:
                 self.proc.stdout.close()
