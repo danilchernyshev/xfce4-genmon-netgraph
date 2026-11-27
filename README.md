@@ -1,5 +1,7 @@
 # xfce4-genmon-netgraph
 
+![panel](docs/screenshot.png)
+
 A cpugraph-style live network graph for the **XFCE panel**, with security signals for
 pentesters: one strip per network card, monitor-mode traffic in its own colour, Wi-Fi
 details, gateway-MAC (ARP spoofing) alerts, PROMISC and VPN detection.
