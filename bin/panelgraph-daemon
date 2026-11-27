@@ -5,7 +5,7 @@ Samples every INTERVAL seconds and keeps PNGs + genmon markup in
 $XDG_RUNTIME_DIR/panelgraph/. Started on demand by panelgraph-show; exits
 when no genmon has asked for output for IDLE_EXIT seconds.
 
-Network graph v2 (see ~/.local/share/panelgraph/requirements.md):
+Network graph v2 (see docs/requirements.md in the repo):
 per-card strips, monitor-mode traffic in its own magenta strip that is never
 added to the managed total, Wi-Fi details and security lines in the tooltip.
 """
@@ -76,6 +76,7 @@ MAX_STRIPS = 3
 WWAN_ENABLED = True                  # F-15: type 65534 with a device link counts as managed
 NOTE_TIME = 600                      # s "Gateway MAC accepted" / "Default route moved" stay
 SLOW_EVERY = 20                      # ticks between slow scans (~5 s)
+BAD_CATS = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})  # stripped by clean() (D-56)
 
 # --- runtime dir (D-55): these lines and secure_dir() are byte-identical in panelgraph-popup ---
 DIR_MODE = 0o700                     # runtime dir is owner-only (F-26)
@@ -124,17 +125,27 @@ def esc(s):
     return html.escape(str(s).encode("utf-8", "replace").decode("utf-8"), quote=False)
 
 
+def clean(s, n, ell=True):
+    """Untrusted text as valid UTF-8 without control, format, private-use, unassigned or
+    line/paragraph-separator characters, at most n code points (D-56). ell marks a cut
+    with "…"; it is never markup-escaped here (esc() does that for the tooltip)."""
+    s = str(s).encode("utf-8", "replace").decode("utf-8")
+    s = "".join(ch for ch in s if unicodedata.category(ch) not in BAD_CATS)
+    if len(s) <= n:
+        return s
+    return s[:n - 1] + "…" if ell else s[:n]
+
+
 def glyph(hx):
     return f'<span foreground="#{hx}">■</span>'
 
 
 def decode_ssid(ssid):
     """iw prints non-printables, edge spaces and '\\' as \\xNN. Decode, drop
-    control characters, truncate; the caller escapes at interpolation time."""
+    unsafe characters, truncate; the caller escapes at interpolation time."""
     raw = re.sub(rb"\\x([0-9a-fA-F]{2})", lambda m: bytes([int(m[1], 16)]),
                  ssid.encode("utf-8", "surrogateescape"))
-    s = raw.decode("utf-8", "replace")
-    return "".join(ch for ch in s if unicodedata.category(ch) != "Cc")[:32]
+    return clean(raw.decode("utf-8", "replace"), 32, ell=False)
 
 
 def hhmm(epoch, fmt="%H:%M"):
