@@ -6,7 +6,8 @@ mkdir -p "$DEST"
 
 cp bin/panelgraph-daemon "$DEST/"
 cp bin/panelgraph-show "$DEST/"
-chmod +x "$DEST/panelgraph-daemon" "$DEST/panelgraph-show"
+cp bin/panelgraph-popup "$DEST/"
+chmod +x "$DEST/panelgraph-daemon" "$DEST/panelgraph-show" "$DEST/panelgraph-popup"
 
 echo "Installed to $DEST/"
 echo ""
