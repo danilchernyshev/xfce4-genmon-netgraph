@@ -8,6 +8,8 @@ when no genmon has asked for output for IDLE_EXIT seconds.
 Network graph v2 (see docs/requirements.md in the repo):
 per-card strips, monitor-mode traffic in its own magenta strip that is never
 added to the managed total, Wi-Fi details and security lines in the tooltip.
+The daemon also starts panelgraph-popup (F-25) and feeds it popup.json; the
+daemon itself stays X-free.
 """
 import fcntl
 import html
@@ -77,6 +79,14 @@ WWAN_ENABLED = True                  # F-15: type 65534 with a device link count
 NOTE_TIME = 600                      # s "Gateway MAC accepted" / "Default route moved" stay
 SLOW_EVERY = 20                      # ticks between slow scans (~5 s)
 BAD_CATS = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})  # stripped by clean() (D-56)
+POPUP_SCHEMA = 1                     # popup.json "v" (D-50)
+POPUP_LABEL_MAX = 40                 # code points per popup label cell (D-56)
+POPUP_SPAN_MAX = 96                  # code points per popup span row; the "!!" row is ~86 (D-56)
+POPUP_RETRY = {0: 5, 2: 5, 3: 300}   # s before respawning the helper, by its exit code (D-54)
+POPUP_RETRY_ELSE = 30                # s after any other exit code, signals included (D-54)
+POPUP_RETRY_SPAWN = 300              # s after the helper could not be started at all (D-54)
+POPUP_QUIET_RC = (0, 2)              # helper exit codes not worth an error.log entry (D-54)
+POPUP_ERROR_ROWS = [{"cells": [[["panelgraph net error, see error.log", None]]]}]  # D-50
 
 # --- runtime dir (D-55): these lines and secure_dir() are byte-identical in panelgraph-popup ---
 DIR_MODE = 0o700                     # runtime dir is owner-only (F-26)
@@ -84,9 +94,17 @@ UMASK = 0o077                        # every file we create is owner-only too
 _XDG = os.environ.get("XDG_RUNTIME_DIR") or ""
 DIR = os.path.join(_XDG, "panelgraph") if os.path.isabs(_XDG) else None
 # --- end of the D-55 block ---
-PIDFILE, LOCK, SEEN, GWJSON = (
-    tuple(os.path.join(DIR, n) for n in ("pid", "lock", "seen", "gw.json"))
-    if DIR else (None,) * 4)
+PIDFILE, LOCK, SEEN, GWJSON, POPUP_JSON, NET_HOST = (
+    tuple(os.path.join(DIR, n) for n in ("pid", "lock", "seen", "gw.json", "popup.json", "net.host"))
+    if DIR else (None,) * 6)
+
+# --- hover popup helper (F-25, requirements 4.7) ---
+POPUP = os.environ.get("PANELGRAPH_POPUP", "1") != "0"           # "0": never start the helper
+# test-only override; resolved now, before main() chdirs, and refused unless absolute (D-54)
+POPUP_CMD = os.environ.get("PANELGRAPH_POPUP_CMD") or os.path.join(
+    os.path.dirname(os.path.abspath(sys.argv[0])), "panelgraph-popup")
+POPUP_XID_SET = bool(os.environ.get("PANELGRAPH_POPUP_XID"))     # helper needs no net.host then
+DISPLAY = os.environ.get("DISPLAY")  # no X display: no helper (the daemon itself never uses X)
 
 
 def read_meminfo():
@@ -879,6 +897,7 @@ class NetMonitor:
         self.ip_forward = 0
         self.promisc = []
         self.vpn = []
+        self.popup = []               # popup.json rows of the last build() (F-25, D-50)
 
     # ---- per tick (F-01) ----
     def sample(self, slow):
@@ -1182,7 +1201,63 @@ class NetMonitor:
         if empty:
             strips.append(("managed", (0, 0), ((0, 0),) * HISTORY, None))
         layout = (alert, tuple(strips))
+        try:
+            self.popup = self.popup_rows(managed, mon_active)
+        except Exception as e:
+            log_once("popup", repr(e))    # auxiliary: never the "!" marker (D-30)
+            self.popup = POPUP_ERROR_ROWS
         return layout, self.tooltip(now, managed, scale, mon_active, mscale)
+
+    # ---- hover popup rows (F-25, D-50) ----
+    def popup_rows(self, managed, mon_active):
+        """popup.json rows: the "!!" line, then one row per strip top to bottom with the
+        numbers of the tooltip's strip lines. Plain text through clean(); never markup."""
+        rows = []
+        if self.gw.line:
+            rows.append({"cells": [[[clean(self.gw.line, POPUP_SPAN_MAX), None]]], "bold": True})
+        default_if = self.route[0] if self.route else None
+        for keys, cols in managed:
+            a, b = cols[-1]
+            rows.append({"cells": [[[clean(self._strip_label(keys, default_if), POPUP_LABEL_MAX), None]],
+                                   [["↓ ", HEX["down"]], [human(a, "B/s"), None]],
+                                   [["↑ ", HEX["up"]], [human(b, "B/s"), None]]]})
+        if mon_active:
+            rows.append(self._monitor_row())
+        if not managed and not mon_active:
+            physical = any(c.has_dev or c.has_phy for c in self.cache.values())
+            text = "No managed interface up" if physical else "No network interfaces"
+            rows.append({"cells": [[[text, None]]]})
+        return rows
+
+    def _strip_label(self, keys, default_if):
+        """Managed strip label with the tooltip's flag, ★ and (down) rules."""
+        if len(keys) > 1:
+            return "other: " + "+".join(keys)
+        k = keys[0]
+        c = self.cache.get(k)
+        parts = [k]
+        flag = self.iface_flag(k) if c is not None and c.has_phy else None
+        if flag:
+            parts.append(flag)
+        if k == default_if:
+            parts.append("★")
+        if not (c is not None and c.kind == "managed" and c.up):
+            parts.append("(down)")
+        return " ".join(parts)
+
+    def _monitor_row(self):
+        """Free row for live monitor vifs (injected only when nonzero), else the span row
+        "monitor ended HH:MM:SS" while the strip lives on history."""
+        if not self.vifs:
+            ended = hhmm(self.mon_ended, "%H:%M:%S") if self.mon_ended else "?"
+            return {"cells": [[[clean(f"monitor ended {ended}", POPUP_SPAN_MAX), None]]]}
+        label = "+".join(sorted(c.name for c in self.vifs)) + " (monitor)"
+        mrx, mtx, _ = self.monh.d[-1]
+        cells = [[[clean(label, POPUP_LABEL_MAX), None]],
+                 [["↓ ", HEX["mrx"]], ["captured " + human(mrx, "B/s"), None]]]
+        if mtx > 0:
+            cells.append([["↑ ", HEX["mtx"]], ["injected " + human(mtx, "B/s"), None]])
+        return {"cells": cells, "free": True}
 
     def wifi_details(self, name, now):
         keys = [("dev",)]
@@ -1338,10 +1413,77 @@ class NetMonitor:
         return "\n".join(lines)
 
 
+class PopupHelper:
+    """The panelgraph-popup child (F-25, D-54): at most one, started only from the slow
+    scan and backed off by its exit code, so it costs at most one spawn per 5 s (NFR-4).
+    popup.json is written only while the child runs (D-50)."""
+
+    def __init__(self):
+        self.proc = None
+        self.exited_at = None         # monotonic time the exit was first seen (A5)
+        self.next_try = 0.0
+        self.last_text = None
+
+    def alive(self):
+        """True while the child runs; reaps it without waiting (one WNOHANG waitpid)."""
+        if self.proc is None:
+            return False
+        if self.proc.poll() is None:
+            return True
+        if self.exited_at is None:
+            self.exited_at = time.monotonic()
+        return False
+
+    def poll(self, now):
+        """Reap an exited child and (re)start one when it is due and wanted."""
+        if self.proc is not None:
+            if self.alive():
+                return
+            rc = self.proc.returncode
+            self.next_try = self.exited_at + POPUP_RETRY.get(rc, POPUP_RETRY_ELSE)
+            if rc not in POPUP_QUIET_RC:
+                log_once("popup", f"helper exited rc={rc}")
+            self.proc = self.exited_at = None
+        if not POPUP or not DISPLAY or now < self.next_try:
+            return
+        if not os.path.isabs(POPUP_CMD):
+            log_once("popup", "PANELGRAPH_POPUP_CMD is not an absolute path; popup disabled")
+            return
+        if not (POPUP_XID_SET or os.path.exists(NET_HOST)):
+            return                    # no net panel item has polled yet
+        try:
+            self.proc = subprocess.Popen([POPUP_CMD], stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         close_fds=True, start_new_session=True,
+                                         env=dict(os.environ, PANELGRAPH_DAEMON_PID=str(os.getpid())))
+        except OSError as e:
+            self.next_try = now + POPUP_RETRY_SPAWN
+            log_once("popup", f"cannot start {POPUP_CMD}: {e!r}")
+
+    def feed(self, rows):
+        """Write popup.json v1 atomically when its text changed (or the file is gone)."""
+        if not self.alive():
+            return
+        text = json.dumps({"v": POPUP_SCHEMA, "rows": rows}, ensure_ascii=False,
+                          separators=(",", ":")) + "\n"
+        if text != self.last_text or not os.path.exists(POPUP_JSON):
+            write_atomic(POPUP_JSON, text)
+            self.last_text = text
+
+    def kill(self):
+        """SIGTERM the running helper's process group; a helper that already exited is left alone."""
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+
 def run(lock):
     mem = Graph("mem")
     net = NetGraph("net")
     netmon = NetMonitor()
+    helper = PopupHelper()
     mem_hist = deque(maxlen=HISTORY)
     tick = 0
 
@@ -1363,6 +1505,10 @@ def run(lock):
                     ensure_pidfile()
                 except OSError:
                     log_error(traceback.format_exc())
+                try:
+                    helper.poll(start)
+                except Exception as e:
+                    log_once("popup", repr(e))
 
             # each graph fails and backs off on its own, so one can't freeze the other
             if start >= mem.retry_at:
@@ -1385,6 +1531,15 @@ def run(lock):
                     net.update(layout, markup)
                 except Exception as e:
                     net.fail(e)
+                    try:
+                        helper.feed(POPUP_ERROR_ROWS)
+                    except Exception:
+                        pass      # best effort: the "!" marker and error.log already report it
+                else:
+                    try:
+                        helper.feed(netmon.popup)
+                    except Exception as e:
+                        log_once("popup", repr(e))    # auxiliary: never the "!" marker (D-30)
 
             tick += 1
             try:
@@ -1398,6 +1553,7 @@ def run(lock):
             time.sleep(max(0.0, INTERVAL - (time.monotonic() - start)))
     finally:
         netmon.iw.kill()
+        helper.kill()
 
 
 def main():
