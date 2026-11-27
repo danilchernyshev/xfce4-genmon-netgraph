@@ -2,7 +2,19 @@
 # genmon command: panelgraph-show mem|net
 # Prints the markup kept by panelgraph-daemon, starting the daemon if needed.
 # Runs 8x/s across both panel items, so it sticks to shell builtins.
-d="${XDG_RUNTIME_DIR:-/tmp}/panelgraph"
+# Only an absolute XDG_RUNTIME_DIR is used: an empty or relative one would land in genmon's
+# cwd, and the old shared /tmp fallback let another user plant files there (F-26, D-55).
+case $XDG_RUNTIME_DIR in
+/*) d="$XDG_RUNTIME_DIR/panelgraph" ;;
+*) echo "<txt>!</txt><tool>panelgraph: XDG_RUNTIME_DIR is not set</tool>"; exit 0 ;;
+esac
+# A symlinked dir, or one another uid planted in a shared XDG_RUNTIME_DIR, would let that uid
+# feed us a <click> and receive our writes; the daemon's secure_dir() refuses it too (D-55).
+# Checked on every call because show keeps no state; -h/-e/-O are test builtins (D-55).
+# A dir that does not exist yet passes, so the first start works: the daemon makes it 0700 (D-55).
+if [ -h "$d" ] || { [ -e "$d" ] && ! [ -O "$d" ]; }; then
+    echo "<txt>!</txt><tool>panelgraph: runtime dir is not private</tool>"; exit 0
+fi
 pid= comm=
 read -r pid 2>/dev/null < "$d/pid"
 [ -n "$pid" ] && read -r comm 2>/dev/null < "/proc/$pid/comm"
@@ -20,6 +32,9 @@ fi
 # true, not ":": a failed redirection on a special builtin exits dash, and the
 # 2> has to come first to swallow the message
 true 2>/dev/null > "$d/seen"
+# genmon execs us directly, so $PPID is its wrapper; the hover popup finds the panel
+# item's window through it (F-25, D-48). printf is a builtin; the 2> comes first as above.
+[ "$1" = net ] && printf '%s\n' "$PPID" 2>/dev/null > "$d/net.host"
 if [ -r "$d/$1.txt" ]; then
     while IFS= read -r line; do printf '%s\n' "$line"; done < "$d/$1.txt"
 else

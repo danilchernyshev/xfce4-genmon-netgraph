@@ -1,8 +1,8 @@
 # panelgraph NETWORK graph v2: QA instructions
 
-Version 1.3, 2026-11-20. v1.3: AC-10 tick-matched method (D-43), AC-52 window t0+44-50 s (D-44), user decisions D-45 (all RECOMMENDED options). Author: BA. **v1.2 adds §11 "WLAN monitor mode testing (consulted with the security specialist)"**: the consultant's full sandbox procedure (gate on the sandbox hooks, fixture checklist, new scenarios S-T and S-U, pass checks, pitfalls) and the live run sheet marked REQUIRES USER APPROVAL. It also adds the `SMOKE` result status and AC-77 to AC-79. v1.1 applied the specialists' sign-off corrections (`requirements.md` §9): harness packet base and signal fixture, monitor vifs with operstate `unknown`, S-B type-802 variant, S-C pps, S-H keeps wlan0, deterministic S-J2, hostile SSID in both iw fixtures, new S-S (AC-76), live L1/L2 tuned with `set freq` at full width. The monitor-mode guidance in §7-§8 comes from the **cyber security specialist**, who is QA's consultant (task card SEC-QA in `requirements.md` §8).
+Version 1.4, 2026-11-27. **v1.4 adds §12, the virtual-X harness and procedures for the hover popup (F-25) and the private runtime dir (F-26), AC-80 to AC-99**, and replaces the stale screen coordinates in §1 and §3 by run-time lookup. Version 1.3, 2026-11-20. v1.3: AC-10 tick-matched method (D-43), AC-52 window t0+44-50 s (D-44), user decisions D-45 (all RECOMMENDED options). Author: BA. **v1.2 adds §11 "WLAN monitor mode testing (consulted with the security specialist)"**: the consultant's full sandbox procedure (gate on the sandbox hooks, fixture checklist, new scenarios S-T and S-U, pass checks, pitfalls) and the live run sheet marked REQUIRES USER APPROVAL. It also adds the `SMOKE` result status and AC-77 to AC-79. v1.1 applied the specialists' sign-off corrections (`requirements.md` §9): harness packet base and signal fixture, monitor vifs with operstate `unknown`, S-B type-802 variant, S-C pps, S-H keeps wlan0, deterministic S-J2, hostile SSID in both iw fixtures, new S-S (AC-76), live L1/L2 tuned with `set freq` at full width. The monitor-mode guidance in §7-§8 comes from the **cyber security specialist**, who is QA's consultant (task card SEC-QA in `requirements.md` §8).
 
-What to verify: `acceptance-criteria.md`, AC-01 to AC-79. The design reference is `requirements.md`. Developer details are in `dev-instructions.md`.
+What to verify: `acceptance-criteria.md`, AC-01 to AC-99. The design reference is `requirements.md`. Developer details are in `dev-instructions.md`.
 
 ---
 
@@ -12,8 +12,8 @@ What to verify: `acceptance-criteria.md`, AC-01 to AC-79. The design reference i
 |---|---|
 | OS / display | Kali Linux, X11 `:0`, 1920x1080, `/bin/sh` = dash, Python 3.14.8, pycairo 1.29.1, PyGObject Pango available |
 | Panel | Xfce top panel, 34 px; plugin ids `1 … 13 26 24 23 14 … 22` |
-| Graph | genmon plugin **26**, command `~/.local/bin/panelgraph-show net`, update-period 250 ms. Wrapper argv: `wrapper-2.0 …/libgenmon.so 26 6291470 genmon …`. Socket window 0x60000e, 142x34 at x=1321, y=0. |
-| Neighbours | cpugraph plugin 13 (0x60000c, x=1143); netload **24** (wlan0, 0x60000f, x=1463, 48x34); netload **23** (wlan1, 0x600010, x=1511, 48x34) |
+| Graph | genmon plugin **26**, command `~/.local/bin/panelgraph-show net`, update-period 250 ms. Wrapper argv: `wrapper-2.0 …/libgenmon.so 26 <socket-xid> genmon …`. Socket window 142x34 in the top panel. **Its position changes when the panel is rearranged (it has moved since v1.3): never use fixed coordinates; resolve it at run time (§3, or `net.host` → wrapper argv[3], §12).** A second genmon item (plugin 15) also runs. |
+| Neighbours (v1.3) | cpugraph plugin 13 to the left; netload **24** (wlan0) and **23** (wlan1) to the right, 48x34 each, if they are still on the panel (see requirements §9, v1.3 item 4). Resolve their geometry the same way. |
 | Daemon output | `/run/user/1000/panelgraph/{net.png,net.txt,mem.*,pid,lock,seen,error.log,gw.json}` |
 | Interfaces | eth0 (e1000e, down); wlan0 (iwlwifi, phy0, down, **flags 0x1103 promisc** because of netdiscover pid <pid>); wlan1 (mt76x2u USB, phy1, UP, SSID HomeNet, BSSID aa:bb:cc:dd:ee:02, ch44 5220 MHz/80, -27 dBm, 192.168.1.25, ifindex 4, carrier_changes 14, default route via 192.168.1.1 metric 603, gateway MAC aa:bb:cc:dd:ee:01); docker0, virbr0, virbr-msf, vnet16/17 (0x1303), lo |
 | ip_forward | 1 (docker/libvirt) |
@@ -51,19 +51,22 @@ def wrapper_pid(lib, pid_id):           # wrapper_pid("libgenmon.so", "26"), ("l
 ```
 
 **Screen geometry.**
-- Take the socket id from above, e.g. 6291470 = 0x60000e. Then:
+- Take the socket id from `wrapper_pid()` above (or from `net.host`: `argv[3]` of the pid it holds), then read the geometry **at test time** (read-only on `:0`):
   ```sh
-  xwininfo -display :0 -id 0x60000e | awk '/Absolute upper-left X/{x=$4} /Absolute upper-left Y/{y=$4} /Width/{w=$2} /Height/{h=$2} END{print x,y,w,h}'
+  XID=$(printf '0x%x' "$SOCKET_ID")
+  read X Y W H <<EOF
+  $(xwininfo -display :0 -id "$XID" | awk '/Absolute upper-left X/{x=$4} /Absolute upper-left Y/{y=$4} /Width/{w=$2} /Height/{h=$2} END{print x,y,w,h}')
+  EOF
   ```
-  Today this prints `1321 0 142 34`.
-- The 140x32 image is drawn at **x+1 … x+140, rows y+1 … y+32**, i.e. screen x 1322-1461, y 1-32. `net.png` pixel (px,py) = screen (x+1+px, y+1+py).
+  Expect `W H` = `142 34`; X and Y vary with the panel layout.
+- The 140x32 image is drawn at **X+1 … X+140, rows Y+1 … Y+32**. `net.png` pixel (px,py) = screen (X+1+px, Y+1+py).
 - Cross-check with `xwininfo -display :0 -root -tree`: plugin 26 is the 142x34 child of the 1920x35 panel window.
 
 **Screenshots:**
 
 ```sh
-import -display :0 -window root -crop 142x34+1321+0 +repage $QA/evidence/AC-xx/p26-$(date +%H%M%S.%N).png      # plugin 26
-import -display :0 -window root -crop 238x34+1321+0 +repage $QA/evidence/AC-12/strip-NN.png                      # 26 + 24 + 23
+import -display :0 -window root -crop 142x34+$X+$Y +repage $QA/evidence/AC-xx/p26-$(date +%H%M%S.%N).png      # plugin 26
+import -display :0 -window root -crop 238x34+$X+$Y +repage $QA/evidence/AC-12/strip-NN.png                      # 26 + 24 + 23
 ```
 
 - Screenshots are RGB without alpha. Compare only r, g, b. Transparent PNG pixels show the panel background (about #293650).
@@ -764,6 +767,8 @@ Verify:
 | AC-70, AC-71, AC-72, AC-73 | §8.5 | **APPROVAL** (user action) |
 | AC-74 | §8.5 | **APPROVAL**; recommended SKIP (OQ-10) |
 | AC-75 | §8.5 | **DEFERRED + APPROVAL**; SKIPPED |
+| AC-80 to AC-92, AC-94 to AC-99 | §12 | sandbox, unit probes and private virtual X (v1.4) |
+| AC-93 | AC file (APPROVAL section) | **APPROVAL**: the user installs and hovers; QA does read-only checks |
 
 **Order of work:**
 1. Snapshot (§4).
@@ -1022,3 +1027,49 @@ def never_summed(rec, managed_rx, managed_tx=None, tol=1.05):
     - the AC-68 counter answer.
 
 **Injection (AC-75) stays DEFERRED** (OQ-12). Even if the user approves it later, it is limited to `sudo aireplay-ng --test wlan0mon` during L1, on phy0 only. Never `-0`, and never phy1.
+
+---
+
+## 12. Hover popup (F-25) and private runtime dir (F-26): virtual-X harness and procedures (v1.4)
+
+Design: `requirements.md` §4.7. ACs: AC-80 to AC-99 (AC-93 live, APPROVAL).
+
+### 12.1 Safety additions
+- GUI tests run **only** on a private virtual display: `Xvfb :99` (or the next free number, 1920x1080x24, `-nolisten tcp`) and, for multi-head, `Xephyr` nested inside it. Every `xdotool` call first asserts `DISPLAY not in (":0", ":0.0")`. On `:0` only read-only `xwininfo`/`xprop` and /proc reads are allowed; never move or click the user's pointer.
+- Start every X client with an explicit env (`DISPLAY=:99`, `GDK_BACKEND=x11`, `NO_AT_BRIDGE=1`, no `XAUTHORITY`), so nothing reaches `:0` by inheritance.
+- Stop processes only through your Popen handles or pid files after comm and cwd checks. Helpers are found by a /proc scan: comm `panelgraph-pop` **and** cwd = the sandbox runtime dir. Never `pgrep -f`/`pkill -f`.
+- If you kill an X server with SIGKILL (AC-91), remove its stale `/tmp/.X<n>-lock` and `/tmp/.X11-unix/X<n>` afterwards, after checking that the pid in the lock is dead.
+- Never write under the live `$XDG_RUNTIME_DIR`; sandbox runtime dirs live under `$QA`.
+
+### 12.2 Harness
+The real chain runs as on the desktop: fake genmon wrapper → `panelgraph-show net` → daemon autostart → helper.
+- `$SB/home/.local/bin/` holds the build's `panelgraph-daemon`, `panelgraph-popup` and `panelgraph-show`; the sandbox env sets `HOME=$SB/home`, so the wrapper starts *that* daemon and the daemon finds the helper next to itself.
+- **Fake panel** (`fake_panel.py`, python3-gi): a `Gtk.WindowType.POPUP` strip, 34 px at the top or bottom (or a 142x600 vertical strip at the left), with one `Gtk.Socket` (142x34) after a padding label of width `SOCK_X`. It writes the socket XID to a file. With `STORM_FLAG=<path>` in its env it runs a relayout storm while that file exists: the padding label alternates between `SOCK_X` and `SOCK_X + 3` px every 250 ms, so the socket moves (a real ConfigureNotify) as it does on a panel with a variable-width neighbour item (AC-86, AC-90). With `KEEP_SOCKET=1` it connects `plug-removed` and returns TRUE, so the socket survives its wrapper as in xfce4-panel 4.20.8 and a new wrapper can embed into the same socket id (AC-91). Without it a GtkSocket destroys itself when its plug goes away.
+- **Fake genmon wrapper** (`libgenmon.so`, a Python file): started through a symlink `$SB/bin/wrapper-2.0 → /usr/bin/python3` as `wrapper-2.0 <path>/libgenmon.so 26 <xid> genmon`, so `/proc/<pid>/cmdline` has the genmon shape. It embeds a `Gtk.Plug` (EventBox without its own window > Button with relief none > Image), runs `FAKE_GENMON_CMD` every 250 ms with fork/exec and wait, like genmon, sets the image, calls `set_tooltip_markup` every poll, and appends `click` to `CLICKLOG` on a button click. Note: the plug may grow the socket (e.g. to 154x38); always read the item's live geometry.
+- The traffic engine and fixtures are `sbx.py` (§5). Add to the wrapper's env every sandbox `PANELGRAPH_*` variable, **always** `PANELGRAPH_ADDRS`.
+- **Stub helper** for content-only ACs (no X): an absolute script that waits on `os.pidfd_open(int(os.environ["PANELGRAPH_DAEMON_PID"]))` and exits; start the daemon with `DISPLAY=:x PANELGRAPH_POPUP_CMD=<stub>` and create `net.host` (any pid) or set `PANELGRAPH_POPUP_XID`.
+- **Spawn counter** (AC-83): `PANELGRAPH_POPUP_CMD` = a script that appends a timestamp to a log and then `exec`s the real helper (same pid).
+- Observation: `xwininfo -name panelgraph-popup` (Map State, Absolute upper-left X/Y, Width, Height, Override Redirect State); `xprop -name panelgraph-popup`; `import -display :99 -window root` for pixels; `/proc/<pid>/stat` utime+stime, `/proc/<pid>/status` VmRSS and `voluntary_ctxt_switches` for cost.
+- A small ctypes Xlib **test client** (QA tooling only) provides what the helper must never do: `XSendEvent` of a synthetic `EnterNotify` to the socket (AC-88), a fullscreen override-redirect window with `XGrabPointer` (AC-99), `XShapeGetRectangles(…, ShapeInput, …)` (AC-88: 0 rectangles) and `XTranslateCoordinates` on root for hit-testing.
+- Multi-head (AC-86): `Xvfb :99 -screen 0 2600x900x24`, then `Xephyr :100 -screen 1280x800+0+0 -screen 1280x800+1280+0 +xinerama -nolisten tcp` with `DISPLAY=:99`; run the panel, wrapper and daemon on `:100`. `xrandr --setmonitor` does not work on Xvfb.
+- Unit probes load the files without side effects: `importlib.machinery.SourceFileLoader("pgp", "bin/panelgraph-popup")` exposes `parse_doc`, `parse_xid`, `parse_monitors`, `parse_dpi`, `resolve_host`, `layout`, `draw`, `place`, `secure_dir`; the daemon exposes `clean`, `decode_ssid`, `secure_dir`, `IwRunner`, `PopupHelper`, `NetMonitor.popup_rows`.
+
+### 12.3 Procedures
+| AC | Procedure |
+|---|---|
+| AC-80 | Run `/bin/sh panelgraph-show net` from a known parent (the QA script): `net.host` = the script's pid + `\n`. Delete it, run `… mem`: not recreated. AC-02 against the sandbox daemon. Cost: source the v1.3 and v1.4 wrapper 4000 times each in a dash loop, three rounds, compare the minima. |
+| AC-81, AC-82 | S-A, S-D, S-F, S-T, S-J1 and a 4-NIC variant with the stub helper; poll popup.json and net.txt every 50 ms. For AC-82: `mkdir $RUN/popup.json.tmp`; all rates 0 for 34 s then watch the mtime for 5 s; restart with `PANELGRAPH_POPUP=0`, without `DISPLAY`, and with `PANELGRAPH_POPUP_CMD=rel/x`. Note: the daemon recreates a deleted popup.json within one tick while the helper lives. |
+| AC-83 | Real chain. Time from `net.host` creation to one helper. `kill -9` the helper and count spawns with the spawn counter for 45 s. Dead display: start the daemon with an unused `DISPLAY` and `PANELGRAPH_POPUP_XID=0x400001`, watch for 40 s (one spawn, `helper exited rc=3` in error.log). Daemon SIGTERM, `kill -9`, and idle exit (stop the wrapper and remove `keepalive`): helper gone ≤ 1 s, `popup.pid` gone. Second instance: run the helper by hand with `PANELGRAPH_DAEMON_PID=<daemon>` → rc 2. |
+| AC-84, AC-85 | Pointer to the item centre with `xdotool mousemove`; sample Map State at +0.35 s and until +0.9 s. Move over 50+ points inside the item (plug and button children), sampling each time. Leave: unmapped ≤ 0.2 s (10 ms sampling). Sweep 50 points outside for 10 s. AC-85: while shown, add `wlan1mon` and wait for the height to grow. |
+| AC-86 | Top panel at x=1300; bottom panel at x=400; vertical left panel; compare with the item rect. Moves: run the storm until the item has moved, stop it, hover (centred on the new rect); while shown, run it until the next move and compare after 0.6 s. Xephyr two heads with the item at x = 1280 − 144; then `PANELGRAPH_POPUP_MONITORS=0,0,1200,800;1200,0,1360,800` with the item near x=1200: right edge ≤ 1196. |
+| AC-87 | Restart panel + wrapper at another x with the pointer already resting where the new item appears; time from `net.host` = the new wrapper pid to "mapped and centred on the new item" (6 repetitions). Add a second wrapper (plugin 15) with `FAKE_GENMON_CMD=/bin/echo <txt>x</txt>`. |
+| AC-88, AC-99 | `xwininfo`/`xprop`; the test client's shape and hit-test queries; click on the item (`xdotool click 1`) and read `CLICKLOG`; `xdotool getwindowfocus` before/after; synthetic `EnterNotify` with the pointer outside; locker window + `XGrabPointer` while shown (5 s). |
+| AC-89 | Screenshot while shown: pixel 4 px inside the left edge at mid-height = 1C1C1E; mid-top border = 3A3A3C; top-left corner ≠ 1C1C1E; count FF2020 pixels in the popup rect (0). |
+| AC-90 | 60 s hidden and attached, then 60 s hidden with the relayout storm; 60 s shown while a thread changes the wlan1 rate every 0.25 s, then 60 s shown with the storm as well; record CPU %, voluntary context switches and VmRSS of helper and daemon. |
+| AC-91, AC-98 | While shown with all rates 0 (stable popup.json): overwrite popup.json with garbage, with > 16 KiB, with `"v":2`, and atomically replace it by a symlink (`os.replace` of a symlink made next to it): pid unchanged, still mapped, same size. Stop the wrapper, write `net.host` with a non-genmon pid of yours, then a symlink: helper alive, `panel item not found` in popup.log. Kill Xvfb: helper gone ≤ 1 s, daemon writes net.txt without "!". Kept socket (`KEEP_SOCKET=1`): hover until shown, stop the wrapper (net.host keeps its dead pid), check the socket is still viewable and the helper holds one pidfd (the daemon's) in `/proc/<pid>/fd`, run the storm for 20 s and count voluntary context switches (≤ 12), stop it, start a new wrapper on the same XID and time from its net.host write to a second pidfd (≤ 2.5 s), then hover (shown, same pid). Bad env values by running the helper by hand with the QA script as its parent (`PANELGRAPH_DAEMON_PID=$$`) in its own runtime dir; popup.log is an append log, so the `[env:monitors]` line is still there after `[attach] panel item not found`. |
+| AC-92 | Same zero-rate fixture with a monitor vif (S-A + `wlan0mon`, all rates 0), 8 s each: POPUP=1 with the stub helper, POPUP=0, and the v1.3 daemon (`git show v1.0.0:bin/panelgraph-daemon`); compare net.png sha256 and the `<tool>` text. Static gate: strip comments with `tokenize` (keep docstrings) and grep the AC-92 list. |
+| AC-94 | `env -i` runs of the wrapper, the daemon and the helper with `XDG_RUNTIME_DIR` unset, `''`, `rel/x` from an empty cwd; check `/tmp/panelgraph` before/after. Symlinked `panelgraph` dir. A pre-created 0775 dir. Unit probe with `os.getuid` patched. |
+| AC-95, AC-97 | S-L with the extended SSID; a fake interface named `"wl\udcff‮x"` (surrogate-escaped byte 0xff). |
+| AC-96 | Unit probe as written in the AC. |
+
+Evidence goes to `$QA/evidence/AC-xx/`; save the placement screenshots (top, bottom, left, two heads), the popup look and the alert row. Never paste live net.txt, popup.json or popup.log content into reports.

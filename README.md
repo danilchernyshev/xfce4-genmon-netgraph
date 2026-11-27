@@ -26,16 +26,27 @@ root and no packet capture, and only reads `/sys` and `/proc`.
 - **Default route moved.** The tooltip notes when the default route switches interface.
 - **PROMISC detection.** The tooltip shows interfaces in promiscuous mode, e.g. a running sniffer.
 - **VPN visibility.** Active tun/WireGuard interfaces are listed (`VPN wg0 up`).
+- **Hover popup.** Rest the pointer on the graph and a small dark popup lists the cards
+  shown in the strips with their live download/upload rates, like the cpugraph tooltip. It
+  updates while shown and disappears when the pointer leaves or you click.
 - **Upload tracking.** A sustained-upload warning and a 5-minute upload total.
 - **Forwarding note.** Shown when IP forwarding is on and two or more managed NICs are up.
 - **Cheap to run.** Samples every 250 ms, spawns at most one `iw` per 5 s, and targets ≤ 2 % of
-  one core and ≤ 40 MB RSS. The daemon exits by itself 30 s after the panel stops asking.
+  one core and ≤ 40 MB RSS. The popup helper sleeps until the pointer enters the graph (about
+  22 MB RSS idle). Everything exits by itself 30 s after the panel stops asking.
 
 ## Requirements
 
 - XFCE panel with `xfce4-genmon-plugin`. Other desktops (Cinnamon, GNOME, KDE) are not
   supported: genmon is an XFCE panel plugin.
 - Python 3.10+ with pycairo (`python3-cairo`)
+- An X11 session with `XDG_RUNTIME_DIR` set to an absolute path (systemd-logind sets it on
+  Kali). Without it the panel item shows `!` and nothing runs: there is no shared `/tmp` fallback.
+- For the hover popup: the Debian packages `libx11-6`, `libxext6`, `libxi6`, `libxinerama1` and
+  `libxrandr2` (sonames `libX11.so.6`, `libXext.so.6`, `libXi.so.6`, `libXinerama.so.1`,
+  `libXrandr.so.2`). All of them ship with Kali XFCE. Without libX11 or libXext the graph still
+  works and only the popup is missing; without libXi a click no longer hides the popup, and
+  without libXinerama/libXrandr the whole root window counts as one monitor.
 - `iw` (optional, for Wi-Fi details)
 - `xfce4-taskmanager` (optional, opened when you click the graph)
 
@@ -46,7 +57,7 @@ sudo apt install xfce4-genmon-plugin python3-cairo iw xfce4-taskmanager
 
 git clone https://github.com/danilchernyshev/xfce4-genmon-netgraph.git
 cd xfce4-genmon-netgraph
-./install.sh            # copies bin/panelgraph-daemon and bin/panelgraph-show to ~/.local/bin
+./install.sh            # copies panelgraph-daemon, panelgraph-show and panelgraph-popup to ~/.local/bin
 ```
 
 Then add the panel item:
@@ -85,7 +96,7 @@ the new version on its next poll.
 Remove the Generic Monitor item from the panel, stop the daemon, then:
 
 ```bash
-rm -f ~/.local/bin/panelgraph-daemon ~/.local/bin/panelgraph-show
+rm -f ~/.local/bin/panelgraph-daemon ~/.local/bin/panelgraph-show ~/.local/bin/panelgraph-popup
 rm -rf "$XDG_RUNTIME_DIR/panelgraph"
 ```
 
@@ -106,7 +117,17 @@ The image is 140×32 px: two current-value bars on the left, then 128 history co
 Strips are stacked top to bottom: managed cards sorted by name, then `other`, then the
 monitor strip. All managed strips share one scale (minimum 64 KiB/s). The monitor strip has its own.
 
-Hover for the tooltip (up to 10 lines):
+Hover over the graph for the popup (about 0.5 s). It has one row per strip, top to bottom,
+plus the gateway alert when there is one:
+
+```
+!! Gateway MAC changed 14:02 aa:bb:cc:dd:ee:01 → de:ad:be:ef:00:01 via wlan1
+wlan1 ★               ↓ 12.0 KiB/s   ↑ 2.2 KiB/s
+wlan0mon (monitor)    ↓ captured 1.2 MiB/s
+```
+
+The full detail view is the genmon tooltip text in `net.txt` (up to 10 lines; `cat
+"$XDG_RUNTIME_DIR/panelgraph/net.txt"`):
 
 ```
 !! Gateway MAC changed 14:02 aa:bb:cc:dd:ee:01 → de:ad:be:ef:00:01 via wlan1
@@ -121,6 +142,17 @@ Idle: eth0 no carrier
 
 `★` marks the default-route interface. The SSID is attacker-controlled input, so it is
 sanitised and escaped before it reaches the panel markup.
+
+### Why genmon's own tooltip never shows
+
+genmon re-sets its tooltip on every poll, even when the text is unchanged. GTK 3 restarts its
+500 ms hover timer on each of those calls, so with a period under about 0.5 s the tooltip never
+appears. The graph needs the 0.25 s period, so panelgraph draws its own popup instead
+(`panelgraph-popup`). If you set a period of 0.6 s or more, both the GTK tooltip and the popup
+can appear; keep 0.25.
+
+Known limitation: with two `panelgraph-show net` items on the panels, the popup attaches to one
+of them (whichever polled last when the helper looked).
 
 ## Gateway MAC alert
 
@@ -158,6 +190,10 @@ All tunables are constants at the top of `bin/panelgraph-daemon`. Edit them, re-
 | `IDLE_EXIT` | `30` | Seconds without a genmon poll before the daemon exits |
 | `CLICK` | `xfce4-taskmanager` | Command run on click |
 
+Hover popup: set `PANELGRAPH_POPUP=0` in the environment the panel runs in to turn it off. Its
+look and timing (`SHOW_DELAY` 0.5 s, colours, font, padding) are constants at the top of
+`bin/panelgraph-popup`.
+
 ## Stopping the daemon
 
 The daemon exits by itself 30 s after the panel item is removed. To stop it now:
@@ -175,12 +211,16 @@ Don't use `pkill -f panelgraph`: the pattern also matches the shell running it.
 xfce4-genmon-plugin (panel item, every 0.25 s)
     └── panelgraph-show net          POSIX sh, builtins only
             ├── prints $XDG_RUNTIME_DIR/panelgraph/net.txt  (<img>, <tool>, <click> markup)
-            ├── touches "seen" (keeps the daemon alive)
+            ├── touches "seen" (keeps the daemon alive) and writes its parent pid to net.host
             └── starts panelgraph-daemon if it isn't running (flock-guarded, single instance)
                     ├── every 250 ms: /sys/class/net/*/statistics + type → per-card and monitor rates
                     ├── every 5 s: /proc/net/route, arp, wireless, flags, ip_forward, iw (async)
                     ├── renders net.png with pycairo (no anti-aliasing, only when pixels change)
-                    └── writes net.png / net.txt atomically (tmp + rename)
+                    ├── writes net.png / net.txt (and popup.json while the helper runs) atomically
+                    └── starts panelgraph-popup (X11 via ctypes, single instance, exits with the daemon)
+                            ├── finds the panel item's window through net.host → genmon wrapper
+                            ├── sleeps until the pointer enters it (X Enter/Leave events, no polling)
+                            └── shows popup.json in an override-redirect, click-through window
 ```
 
 Runtime files in `$XDG_RUNTIME_DIR/panelgraph/`:
@@ -193,6 +233,12 @@ Runtime files in `$XDG_RUNTIME_DIR/panelgraph/`:
 | `seen` | touched on every poll, used for idle exit |
 | `gw.json` | gateway MAC baseline (delete it to accept a new MAC) |
 | `error.log` | last error |
+| `net.host` | pid of the genmon wrapper of the net item (the popup finds the item through it) |
+| `popup.json` | the popup's rows, written by the daemon while the helper runs |
+| `popup.pid`, `popup.lock` | popup helper pid, single-instance flock |
+| `popup.log` | the popup helper's recent problems (≤ 16 KiB) |
+
+The directory is created with mode 0700 and must belong to you. If it is a symlink or belongs to another user, both `panelgraph-show` and the daemon refuse it, and the panel item shows `!` (`<tool>panelgraph: runtime dir is not private</tool>` in the markup).
 
 ## Testing
 
@@ -208,11 +254,19 @@ and ARP spoofing can be tested without root and without touching real interfaces
 | `PANELGRAPH_ADDRS` | file of `ifname ip` lines instead of the `SIOCGIFADDR` ioctl (always set it in a sandbox) |
 | `PANELGRAPH_IW` | path to `iw` (point it at a stub) |
 | `PANELGRAPH_ALERT_HOLD` | gateway alert hold time, seconds (default 600) |
-| `XDG_RUNTIME_DIR` | output directory (use a separate one so the sandbox gets its own lock and pid) |
+| `XDG_RUNTIME_DIR` | output directory, absolute (use a separate one so the sandbox gets its own lock and pid) |
+| `PANELGRAPH_POPUP` | `0` disables the hover popup helper |
+| `PANELGRAPH_POPUP_CMD` | absolute path of the helper (test only; default: next to the daemon) |
+| `PANELGRAPH_POPUP_XID` | window id the popup watches instead of the `net.host` lookup |
+| `PANELGRAPH_POPUP_MONITORS` | `x,y,w,h;…` monitor rects instead of Xinerama/RandR |
+| `PANELGRAPH_DAEMON_PID` | set by the daemon for the helper; the helper exits 3 if it is missing or invalid (internal, not a user setting) |
+
+Test the popup only on a virtual display (Xvfb/Xephyr), never on your real `:0`
+(`docs/qa-instructions.md` §12).
 
 Documentation:
-- `docs/requirements.md`: specification v1.3, including the decision log and traceability.
-- `docs/acceptance-criteria.md`: acceptance criteria AC-01 to AC-79.
+- `docs/requirements.md`: specification v1.4, including the decision log and traceability.
+- `docs/acceptance-criteria.md`: acceptance criteria AC-01 to AC-99.
 - `docs/dev-instructions.md`: implementation guide and the constraints to keep.
 - `docs/qa-instructions.md`: QA procedures and the sandbox harness `sbx.py`.
 

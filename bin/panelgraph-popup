@@ -1,0 +1,1221 @@
+#!/usr/bin/env python3
+"""Hover popup for the panelgraph network graph (F-25, requirements 4.7).
+
+genmon re-sets its tooltip on every poll, which keeps GTK from ever showing it at a
+0.25 s period (DEF-06). panelgraph-daemon therefore starts this helper and feeds it
+$XDG_RUNTIME_DIR/panelgraph/popup.json. The helper watches the genmon panel item's
+socket window for Enter/Leave only, and the wrapper's exit through a pidfd, so panel
+redraws and relayouts never wake it while hidden (D-58). While the pointer rests
+on the item it shows a small dark override-redirect window, transparent to input, that
+lists the graph's strips with their rates.
+
+X is reached through ctypes (libX11, libXext, libXi, libXinerama, libXrandr) and the
+text is drawn with pycairo. The helper starts no processes, takes no grabs, never moves
+the pointer and never takes focus (D-47 to D-54).
+"""
+import ctypes
+import fcntl
+import json
+import math
+import os
+import re
+import select
+import signal
+import stat
+import sys
+import time
+import traceback
+
+# --- identity and lifecycle (D-54) ---
+PROC_NAME = "panelgraph-pop"         # /proc/<pid>/comm; never "panelgraph", which counts daemons
+EXIT_OK = 0                          # daemon gone or SIGTERM; the daemon may respawn after 5 s
+EXIT_CRASH = 1                       # unexpected exception, traceback in popup.log; retry 30 s
+EXIT_BUSY = 2                        # another helper holds popup.lock; retry 5 s
+EXIT_UNAVAILABLE = 3                 # no display/X libs/usable visual, bad DAEMON_PID; retry 300 s
+
+# --- timing (D-49) ---
+SHOW_DELAY = 0.5                     # s of hover before the popup shows, like a GTK tooltip
+REFRESH = 0.25                       # s between content and pointer re-checks while shown (SEC-10)
+ATTACH_RETRY = 2.0                   # s between panel-item lookups while detached (D-48)
+LOG_ONCE_PERIOD = 600                # s between popup.log entries with the same key
+POPUP_LOG_MAX = 16384                # B; an append that would pass this restarts popup.log (D-54)
+POPUP_LOG_ENTRY_MAX = 4096           # code points per entry; the tail (a traceback's last frames) is kept
+LOG_MODE = 0o600                     # popup.log is owner-only, like everything in DIR (F-26)
+
+# --- input limits (SEC-02, SEC-05) ---
+HOST_MAX = 32                        # B read from net.host
+DOC_MAX = 16384                      # B read from popup.json; larger files are ignored
+CMDLINE_MAX = 4096                   # B read from /proc/<pid>/cmdline
+XID_MAX = 0x1FFFFFFF                 # X resource ids have 29 bits
+COORD_MAX = 32767                    # |x|, |y|, w, h of a PANELGRAPH_POPUP_MONITORS entry
+MAX_ROWS = 4                         # rows drawn: "!!" alert + 3 strips
+MAX_CELLS = 4                        # cells per row
+MAX_SEGS = 4                         # [text, colour] segments per cell
+TEXT_MAX = 128                       # code points per segment; the "!!" row is ~86
+SURF_MAX_W, SURF_MAX_H = 2048, 512   # px, surface cap before allocation
+WRAPPER_NAME = b"wrapper-2.0"        # basename of the xfce4-panel plugin wrapper (argv[0])
+GENMON_LIB = b"libgenmon.so"         # argv[1] suffix of a genmon item; argv[3] is its socket XID
+
+# --- look (D-52): fixed dark colours, theme-independent and testable ---
+BG = "1C1C1E"                        # popup background
+BORDER = "3A3A3C"                    # border colour
+BORDER_W = 1                         # px popup border (D-52)
+TEXT = "E6E6E6"                      # text without a glyph colour
+GLYPH_COLORS = frozenset({"FF4F00", "FFE500", "FF00FF", "FFA0FF"})   # the graph's four, never FF2020
+FONT_FACE = "DejaVu Sans"            # cairo toy face; fontconfig substitutes when missing
+FONT_PX = 13                         # font size at 96 dpi
+PAD_X, PAD_Y = 10, 6                 # px padding at 96 dpi
+COL_GAP = 14                         # px between cells at 96 dpi
+LINE_GAP = 3                         # px between rows at 96 dpi
+RADIUS = 6                           # px corner radius at 96 dpi
+GAP = 4                              # px between the panel item and the popup (D-53)
+MARGIN = 4                           # px the popup keeps from the monitor edges (D-53)
+DPI_DEFAULT, DPI_MIN, DPI_MAX = 96.0, 72.0, 288.0   # Xft.dpi fallback and clamp (kali-hidpi-mode)
+
+# --- states (D-49) ---
+DETACHED, IDLE, PENDING, SHOWN, SUPPRESSED = "detached", "idle", "pending", "shown", "suppressed"
+
+# --- env hooks, read once; validated where they are used (requirements 4.0) ---
+POPUP_XID_ENV = os.environ.get("PANELGRAPH_POPUP_XID")          # sandbox: target window, skips net.host
+MONITORS_ENV = os.environ.get("PANELGRAPH_POPUP_MONITORS")      # sandbox: "x,y,w,h;..." monitor override
+DAEMON_PID_ENV = os.environ.get("PANELGRAPH_DAEMON_PID")        # set by panelgraph-daemon
+
+# --- runtime dir (D-55): these lines and secure_dir() are byte-identical in panelgraph-daemon ---
+DIR_MODE = 0o700                     # runtime dir is owner-only (F-26)
+UMASK = 0o077                        # every file we create is owner-only too
+_XDG = os.environ.get("XDG_RUNTIME_DIR") or ""
+DIR = os.path.join(_XDG, "panelgraph") if os.path.isabs(_XDG) else None
+# --- end of the D-55 block ---
+POPUP_PID, POPUP_LOCK, POPUP_LOG, POPUP_JSON, NET_HOST = (
+    tuple(os.path.join(DIR, n) for n in ("popup.pid", "popup.lock", "popup.log", "popup.json", "net.host"))
+    if DIR else (None,) * 5)
+
+# --- Xlib protocol constants (X.h, XI2.h, shape.h, prctl.h), named for the AC-92 static gate ---
+EnterWindowMask = 1 << 4
+LeaveWindowMask = 1 << 5
+StructureNotifyMask = 1 << 17
+NoEventMask = 0                      # X: deselect a foreign window (D-58)
+EnterNotify, LeaveNotify, DestroyNotify, UnmapNotify, ConfigureNotify = 7, 8, 17, 18, 22
+# Hidden, only crossings: StructureNotify would wake us on every panel relayout (D-58).
+ITEM_MASK_HIDDEN = EnterWindowMask | LeaveWindowMask
+ITEM_MASK_SHOWN = ITEM_MASK_HIDDEN | StructureNotifyMask   # shown: re-place on moves, see the item go
+GenericEvent = 35
+NotifyGrab = 1                       # crossing mode
+NotifyInferior = 2                   # crossing detail
+InputOutput = 1
+CWBackPixel, CWBorderPixel, CWOverrideRedirect = 1 << 1, 1 << 3, 1 << 9
+ZPixmap = 2
+LSBFirst, MSBFirst = 0, 1
+HOST_BYTE_ORDER = LSBFirst if sys.byteorder == "little" else MSBFirst   # cairo pixels are native
+TrueColor = 4
+RGB_MASKS = (0xFF0000, 0x00FF00, 0x0000FF)   # the only visual layout cairo RGB24 matches (SEC-03)
+IMAGE_BPP = 32
+PropModeReplace = 0
+PROP_FORMAT_8 = 8
+PROP_FORMAT_32 = 32                  # XChangeProperty element sizes, bits
+XA_ATOM, XA_STRING = 4, 31
+ShapeBounding, ShapeInput = 0, 2
+ShapeSet = 0
+Unsorted = 0
+XIAllMasterDevices = 1
+XI_RawButtonPress = 15
+XI_MASK_LEN = 4                      # XIMaskLen(XI_LASTEVENT)
+XI_VERSION = (2, 2)                  # raw events also arrive while another client grabs
+PR_SET_PDEATHSIG = 1
+X_SUCCESS = 0
+
+c_int, c_uint, c_long, c_ulong = ctypes.c_int, ctypes.c_uint, ctypes.c_long, ctypes.c_ulong
+c_void_p, c_char_p, c_short, c_ushort = ctypes.c_void_p, ctypes.c_char_p, ctypes.c_short, ctypes.c_ushort
+P = ctypes.POINTER
+
+
+# --- Xlib structures (Xlib.h, Xinerama.h, Xrandr.h, XInput2.h) ---
+class XAnyEvent(ctypes.Structure):
+    _fields_ = [("type", c_int), ("serial", c_ulong), ("send_event", c_int), ("display", c_void_p),
+                ("window", c_ulong)]
+
+
+class XCrossingEvent(ctypes.Structure):
+    _fields_ = [("type", c_int), ("serial", c_ulong), ("send_event", c_int), ("display", c_void_p),
+                ("window", c_ulong), ("root", c_ulong), ("subwindow", c_ulong), ("time", c_ulong),
+                ("x", c_int), ("y", c_int), ("x_root", c_int), ("y_root", c_int),
+                ("mode", c_int), ("detail", c_int), ("same_screen", c_int), ("focus", c_int),
+                ("state", c_uint)]
+
+
+class XConfigureEvent(ctypes.Structure):
+    _fields_ = [("type", c_int), ("serial", c_ulong), ("send_event", c_int), ("display", c_void_p),
+                ("event", c_ulong), ("window", c_ulong), ("x", c_int), ("y", c_int),
+                ("width", c_int), ("height", c_int), ("border_width", c_int), ("above", c_ulong),
+                ("override_redirect", c_int)]
+
+
+class XGenericEventCookie(ctypes.Structure):
+    _fields_ = [("type", c_int), ("serial", c_ulong), ("send_event", c_int), ("display", c_void_p),
+                ("extension", c_int), ("evtype", c_int), ("cookie", c_uint), ("data", c_void_p)]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [("type", c_int), ("xany", XAnyEvent), ("xcrossing", XCrossingEvent),
+                ("xconfigure", XConfigureEvent), ("xcookie", XGenericEventCookie),
+                ("pad", c_long * 24)]
+
+
+class XErrorEvent(ctypes.Structure):
+    _fields_ = [("type", c_int), ("display", c_void_p), ("resourceid", c_ulong), ("serial", c_ulong),
+                ("error_code", ctypes.c_ubyte), ("request_code", ctypes.c_ubyte),
+                ("minor_code", ctypes.c_ubyte)]
+
+
+class Visual(ctypes.Structure):
+    _fields_ = [("ext_data", c_void_p), ("visualid", c_ulong), ("class_", c_int),
+                ("red_mask", c_ulong), ("green_mask", c_ulong), ("blue_mask", c_ulong),
+                ("bits_per_rgb", c_int), ("map_entries", c_int)]
+
+
+class XPixmapFormatValues(ctypes.Structure):
+    _fields_ = [("depth", c_int), ("bits_per_pixel", c_int), ("scanline_pad", c_int)]
+
+
+class XImageHead(ctypes.Structure):
+    """The leading fields of XImage: enough to hand our buffer back before XFree."""
+    _fields_ = [("width", c_int), ("height", c_int), ("xoffset", c_int), ("format", c_int),
+                ("data", c_void_p), ("byte_order", c_int)]
+
+
+class XWindowAttributes(ctypes.Structure):
+    _fields_ = [("x", c_int), ("y", c_int), ("width", c_int), ("height", c_int),
+                ("border_width", c_int), ("depth", c_int), ("visual", c_void_p), ("root", c_ulong),
+                ("class_", c_int), ("bit_gravity", c_int), ("win_gravity", c_int),
+                ("backing_store", c_int), ("backing_planes", c_ulong), ("backing_pixel", c_ulong),
+                ("save_under", c_int), ("colormap", c_ulong), ("map_installed", c_int),
+                ("map_state", c_int), ("all_event_masks", c_long), ("your_event_mask", c_long),
+                ("do_not_propagate_mask", c_long), ("override_redirect", c_int), ("screen", c_void_p)]
+
+
+class XSetWindowAttributes(ctypes.Structure):
+    _fields_ = [("background_pixmap", c_ulong), ("background_pixel", c_ulong),
+                ("border_pixmap", c_ulong), ("border_pixel", c_ulong), ("bit_gravity", c_int),
+                ("win_gravity", c_int), ("backing_store", c_int), ("backing_planes", c_ulong),
+                ("backing_pixel", c_ulong), ("save_under", c_int), ("event_mask", c_long),
+                ("do_not_propagate_mask", c_long), ("override_redirect", c_int),
+                ("colormap", c_ulong), ("cursor", c_ulong)]
+
+
+class XRectangle(ctypes.Structure):
+    _fields_ = [("x", c_short), ("y", c_short), ("width", c_ushort), ("height", c_ushort)]
+
+
+class XineramaScreenInfo(ctypes.Structure):
+    _fields_ = [("screen_number", c_int), ("x_org", c_short), ("y_org", c_short),
+                ("width", c_short), ("height", c_short)]
+
+
+class XRRMonitorInfo(ctypes.Structure):
+    _fields_ = [("name", c_ulong), ("primary", c_int), ("automatic", c_int), ("noutput", c_int),
+                ("x", c_int), ("y", c_int), ("width", c_int), ("height", c_int),
+                ("mwidth", c_int), ("mheight", c_int), ("outputs", c_void_p)]
+
+
+class XIEventMask(ctypes.Structure):
+    _fields_ = [("deviceid", c_int), ("mask_len", c_int), ("mask", P(ctypes.c_ubyte))]
+
+
+XErrorHandler = ctypes.CFUNCTYPE(c_int, c_void_p, P(XErrorEvent))
+XIOErrorHandler = ctypes.CFUNCTYPE(c_int, c_void_p)
+
+# --- the one declaration table: (soname, required, ((name, restype, *argtypes), ...)) (SEC-03) ---
+# Sonames, not ctypes.util.find_library: that runs ldconfig, and the helper starts no processes.
+LIBS = {
+    "X": ("libX11.so.6", True, (
+        ("XOpenDisplay", c_void_p, c_char_p),
+        ("XConnectionNumber", c_int, c_void_p),
+        ("XDefaultScreen", c_int, c_void_p),
+        ("XRootWindow", c_ulong, c_void_p, c_int),
+        ("XDefaultVisual", P(Visual), c_void_p, c_int),
+        ("XDefaultDepth", c_int, c_void_p, c_int),
+        ("XListPixmapFormats", P(XPixmapFormatValues), c_void_p, P(c_int)),
+        ("XFree", c_int, c_void_p),
+        ("XSetErrorHandler", c_void_p, XErrorHandler),
+        ("XSetIOErrorHandler", c_void_p, XIOErrorHandler),
+        ("XResourceManagerString", c_char_p, c_void_p),
+        ("XCreateWindow", c_ulong, c_void_p, c_ulong, c_int, c_int, c_uint, c_uint, c_uint, c_int,
+         c_uint, P(Visual), c_ulong, P(XSetWindowAttributes)),
+        ("XStoreName", c_int, c_void_p, c_ulong, c_char_p),
+        ("XInternAtom", c_ulong, c_void_p, c_char_p, c_int),
+        ("XChangeProperty", c_int, c_void_p, c_ulong, c_ulong, c_ulong, c_int, c_int, c_void_p, c_int),
+        ("XCreateGC", c_void_p, c_void_p, c_ulong, c_ulong, c_void_p),
+        ("XSelectInput", c_int, c_void_p, c_ulong, c_long),
+        ("XGetWindowAttributes", c_int, c_void_p, c_ulong, P(XWindowAttributes)),
+        ("XTranslateCoordinates", c_int, c_void_p, c_ulong, c_ulong, c_int, c_int,
+         P(c_int), P(c_int), P(c_ulong)),
+        ("XQueryPointer", c_int, c_void_p, c_ulong, P(c_ulong), P(c_ulong), P(c_int), P(c_int),
+         P(c_int), P(c_int), P(c_uint)),
+        ("XQueryTree", c_int, c_void_p, c_ulong, P(c_ulong), P(c_ulong), P(P(c_ulong)), P(c_uint)),
+        ("XQueryExtension", c_int, c_void_p, c_char_p, P(c_int), P(c_int), P(c_int)),
+        ("XPending", c_int, c_void_p),
+        ("XNextEvent", c_int, c_void_p, P(XEvent)),
+        ("XFlush", c_int, c_void_p),
+        ("XSync", c_int, c_void_p, c_int),
+        ("XMapRaised", c_int, c_void_p, c_ulong),
+        ("XUnmapWindow", c_int, c_void_p, c_ulong),
+        ("XMoveResizeWindow", c_int, c_void_p, c_ulong, c_int, c_int, c_uint, c_uint),
+        ("XCreatePixmap", c_ulong, c_void_p, c_ulong, c_uint, c_uint, c_uint),
+        ("XFreePixmap", c_int, c_void_p, c_ulong),
+        ("XCreateImage", P(XImageHead), c_void_p, P(Visual), c_uint, c_int, c_int, c_void_p,
+         c_uint, c_uint, c_int, c_int),
+        ("XPutImage", c_int, c_void_p, c_ulong, c_void_p, P(XImageHead), c_int, c_int, c_int, c_int,
+         c_uint, c_uint),
+        ("XSetWindowBackgroundPixmap", c_int, c_void_p, c_ulong, c_ulong),
+        ("XClearWindow", c_int, c_void_p, c_ulong),
+        ("XGetEventData", c_int, c_void_p, P(XGenericEventCookie)),
+        ("XFreeEventData", None, c_void_p, P(XGenericEventCookie)),
+    )),
+    "Xext": ("libXext.so.6", True, (
+        ("XShapeQueryExtension", c_int, c_void_p, P(c_int), P(c_int)),
+        ("XShapeCombineRectangles", None, c_void_p, c_ulong, c_int, c_int, c_int, P(XRectangle),
+         c_int, c_int, c_int),
+    )),
+    "Xi": ("libXi.so.6", False, (
+        ("XIQueryVersion", c_int, c_void_p, P(c_int), P(c_int)),
+        ("XISelectEvents", c_int, c_void_p, c_ulong, P(XIEventMask), c_int),
+    )),
+    "Xinerama": ("libXinerama.so.1", False, (
+        ("XineramaIsActive", c_int, c_void_p),
+        ("XineramaQueryScreens", P(XineramaScreenInfo), c_void_p, P(c_int)),
+    )),
+    "Xrandr": ("libXrandr.so.2", False, (
+        ("XRRGetMonitors", P(XRRMonitorInfo), c_void_p, c_ulong, c_int, P(c_int)),
+        ("XRRFreeMonitors", None, P(XRRMonitorInfo)),
+    )),
+    "libc": ("libc.so.6", True, (
+        ("prctl", c_int, c_int, c_ulong, c_ulong, c_ulong, c_ulong),
+    )),
+}
+
+
+# --------------------------------------------------------------------------
+# pure helpers (no X; QA loads them through SourceFileLoader, A9)
+# --------------------------------------------------------------------------
+
+def secure_dir():
+    """True once DIR exists as a real directory owned by us with mode 0700; False when
+    XDG_RUNTIME_DIR is unusable or DIR is a symlink or someone else's (F-26, D-55).
+    Byte-identical in panelgraph-daemon and panelgraph-popup."""
+    os.umask(UMASK)
+    if DIR is None:
+        return False
+    os.makedirs(DIR, DIR_MODE, exist_ok=True)
+    st = os.lstat(DIR)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        return False
+    if st.st_mode & UMASK:
+        os.chmod(DIR, DIR_MODE)
+    return True
+
+
+def write_atomic(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+_LOGGED = {}
+
+
+def log_once(key, msg):
+    """Append a problem to popup.log, at most once per key per LOG_ONCE_PERIOD; the log
+    restarts when it would pass POPUP_LOG_MAX (D-54). The one file not written only
+    through write_atomic: appending keeps the root cause next to what followed it."""
+    now = time.monotonic()
+    last = _LOGGED.get(key)
+    if last is not None and now - last < LOG_ONCE_PERIOD:
+        return
+    _LOGGED[key] = now
+    if POPUP_LOG is None:
+        return
+    msg = msg if len(msg) <= POPUP_LOG_ENTRY_MAX else msg[-POPUP_LOG_ENTRY_MAX:]   # a traceback's tail
+    entry = time.strftime("%Y-%m-%d %H:%M:%S ") + f"[{key}] {msg}\n"
+    data = entry.encode("utf-8", "replace")[-POPUP_LOG_MAX:]   # wide code points cannot pass the cap
+    try:
+        # O_NONBLOCK: a FIFO planted as popup.log must not hang the helper (SEC-02)
+        fd = os.open(POPUP_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+                     | os.O_NONBLOCK, LOG_MODE)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return
+            if st.st_size + len(data) <= POPUP_LOG_MAX:
+                os.write(fd, data)
+                return
+        finally:
+            os.close(fd)
+        write_atomic(POPUP_LOG, data.decode("utf-8", "ignore"))
+    except OSError:
+        pass                         # nowhere left to report to; the popup degrades silently
+
+
+def read_capped(path, cap):
+    """Bytes of a regular file of at most cap bytes, never through a symlink and never
+    blocking on a FIFO; None otherwise (SEC-02)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, cap + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return data if len(data) <= cap else None
+
+
+def remove_pidfile():
+    """Remove popup.pid only while it still holds our pid."""
+    if POPUP_PID and read_capped(POPUP_PID, HOST_MAX) == str(os.getpid()).encode():
+        try:
+            os.unlink(POPUP_PID)
+        except OSError:
+            pass
+
+
+def parse_pid(text):
+    """A positive decimal pid from PANELGRAPH_DAEMON_PID, else None."""
+    return int(text) if text and re.fullmatch(r"[1-9][0-9]{0,9}", text) else None
+
+
+def parse_xid(text, allow_hex=True):
+    """An X window id in 1..XID_MAX: decimal, or 0x hex when allowed; else None (SEC-02)."""
+    if not isinstance(text, str):
+        return None
+    if re.fullmatch(r"[1-9][0-9]{0,9}", text):
+        xid = int(text)
+    elif allow_hex and re.fullmatch(r"0[xX][0-9a-fA-F]{1,8}", text):
+        xid = int(text, 16)
+    else:
+        return None
+    return xid if 1 <= xid <= XID_MAX else None
+
+
+def read_host_pid():
+    """The genmon wrapper pid that panelgraph-show wrote to net.host, else None."""
+    data = read_capped(NET_HOST, HOST_MAX)
+    if data is None or not re.fullmatch(rb"[1-9][0-9]{0,9}\n?", data):
+        return None
+    return int(data)
+
+
+def resolve_host(pid):
+    """The socket XID of genmon item `pid`: a process of ours whose argv is
+    wrapper-2.0 .../libgenmon.so <id> <xid> ... (D-48, SEC-02); else None."""
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            return None
+    except OSError:
+        return None
+    data = read_capped(f"/proc/{pid}/cmdline", CMDLINE_MAX)
+    argv = data.split(b"\0") if data else []
+    if len(argv) < 4 or os.path.basename(argv[0]) != WRAPPER_NAME or not argv[1].endswith(GENMON_LIB):
+        return None
+    return parse_xid(argv[3].decode("ascii", "replace"), allow_hex=False)
+
+
+def parse_monitors(text):
+    """PANELGRAPH_POPUP_MONITORS "x,y,w,h;..." as a list of 4-tuples, or None when any
+    entry is malformed or out of range (the override is then ignored, SEC-05)."""
+    out = []
+    try:
+        for entry in text.split(";"):
+            if not entry.strip():
+                continue
+            x, y, w, h = (int(v) for v in entry.split(","))
+            if w <= 0 or h <= 0 or max(abs(x), abs(y), w, h) > COORD_MAX:
+                return None
+            out.append((x, y, w, h))
+    except (AttributeError, ValueError):
+        return None
+    return out or None
+
+
+def parse_dpi(resources):
+    """Xft.dpi from the RESOURCE_MANAGER string, clamped to DPI_MIN..DPI_MAX, else 96."""
+    for line in (resources or b"").decode("utf-8", "replace").split("\n"):
+        key, _, value = line.partition(":")
+        if key.strip() != "Xft.dpi":
+            continue
+        try:
+            dpi = float(value)
+        except ValueError:
+            return DPI_DEFAULT
+        return min(DPI_MAX, max(DPI_MIN, dpi)) if math.isfinite(dpi) else DPI_DEFAULT
+    return DPI_DEFAULT
+
+
+class Row:
+    """One validated popup.json row: cells of (text, colour hex or None) segments."""
+    __slots__ = ("cells", "bold", "free")
+
+    def __init__(self, cells, bold, free):
+        self.cells, self.bold, self.free = cells, bold, free
+
+
+def _parse_seg(seg):
+    """[text, colour] -> (text cut to TEXT_MAX, whitelisted colour or None); None if malformed."""
+    if not isinstance(seg, list) or len(seg) != 2 or not isinstance(seg[0], str):
+        return None
+    text = seg[0][:TEXT_MAX].encode("utf-8", "replace").decode("utf-8")
+    color = seg[1] if isinstance(seg[1], str) and seg[1] in GLYPH_COLORS else None
+    return text, color
+
+
+def _parse_row(row):
+    """A popup.json row as a Row, or None on any structural violation (SEC-05)."""
+    if not isinstance(row, dict) or not isinstance(row.get("cells"), list):
+        return None
+    cells = row["cells"]
+    if not 1 <= len(cells) <= MAX_CELLS:
+        return None
+    out = []
+    for cell in cells:
+        if not isinstance(cell, list) or len(cell) > MAX_SEGS:
+            return None
+        segs = [_parse_seg(s) for s in cell]
+        if None in segs:
+            return None
+        out.append(tuple(segs))
+    return Row(tuple(out), row.get("bold") is True, row.get("free") is True)
+
+
+def parse_doc(data):
+    """popup.json bytes -> tuple of at most MAX_ROWS Rows, or None if the document is not
+    a valid v1 doc (D-50, SEC-05). The text is drawn literally: there is no markup."""
+    if data is None:
+        return None
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(doc, dict) or type(doc.get("v")) is not int or doc["v"] != 1:
+        return None
+    rows = doc.get("rows")
+    if not isinstance(rows, list):
+        return None
+    out = tuple(_parse_row(r) for r in rows[:MAX_ROWS])
+    return None if None in out else out
+
+
+class Metrics:
+    """Font size and spacing in px for one Xft.dpi."""
+    __slots__ = ("font_px", "pad_x", "pad_y", "col_gap", "line_gap", "radius")
+
+    def __init__(self, dpi=DPI_DEFAULT):
+        s = dpi / DPI_DEFAULT
+        self.font_px = FONT_PX * s
+        self.pad_x, self.pad_y = round(PAD_X * s), round(PAD_Y * s)
+        self.col_gap, self.line_gap = round(COL_GAP * s), round(LINE_GAP * s)
+        self.radius = round(RADIUS * s)
+
+
+class Layout:
+    """Natural popup size, row pitch, first baseline, and the x of every cell."""
+    __slots__ = ("width", "height", "line_h", "ascent", "xs")
+
+    def __init__(self, width, height, line_h, ascent, xs):
+        self.width, self.height, self.line_h, self.ascent, self.xs = width, height, line_h, ascent, xs
+
+
+def set_font(cr, m, bold):
+    """Select the popup face at the metrics' size, grey anti-aliasing only (no subpixel fringes)."""
+    import cairo
+    cr.select_font_face(FONT_FACE, cairo.FONT_SLANT_NORMAL,
+                        cairo.FONT_WEIGHT_BOLD if bold else cairo.FONT_WEIGHT_NORMAL)
+    cr.set_font_size(m.font_px)
+    opts = cairo.FontOptions()
+    opts.set_antialias(cairo.ANTIALIAS_GRAY)     # grey AA only: no subpixel colour fringes
+    cr.set_font_options(opts)
+
+
+def column_widths(rows, widths):
+    """Column 0 over every multi-cell row (table and free), columns >= 1 over table rows
+    only (D-50); a free row's cells flow after column 0."""
+    col = [0.0] * MAX_CELLS
+    for r, w in zip(rows, widths):
+        if len(w) < 2:
+            continue
+        col[0] = max(col[0], w[0])
+        if not r.free:
+            for i in range(1, len(w)):
+                col[i] = max(col[i], w[i])
+    return col
+
+
+def layout(rows, m):
+    """Measure rows with a cairo context and place every cell (D-50)."""
+    import cairo
+    probe = cairo.Context(cairo.ImageSurface(cairo.FORMAT_RGB24, 1, 1))
+
+    def width(cell, bold):
+        set_font(probe, m, bold)
+        return sum(probe.text_extents(t).x_advance for t, _ in cell)
+
+    widths = [[width(c, r.bold) for c in r.cells] for r in rows]
+    col = column_widths(rows, widths)
+    xs, right = [], 0.0
+    for r, w in zip(rows, widths):
+        x, row_xs = m.pad_x, []
+        for i, cw in enumerate(w):
+            row_xs.append(x)
+            if len(w) > 1 and (i == 0 or not r.free):
+                x += col[i] + m.col_gap
+            else:
+                x += cw + m.col_gap
+        right = max(right, row_xs[-1] + w[-1])
+        xs.append(row_xs)
+    set_font(probe, m, False)
+    ascent, descent = probe.font_extents()[:2]
+    line_h = math.ceil(ascent + descent) + m.line_gap
+    height = line_h * len(rows) - m.line_gap + 2 * m.pad_y
+    return Layout(math.ceil(right) + m.pad_x, height, line_h, ascent, xs)
+
+
+def rgb(hx):
+    return tuple(int(hx[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def corner_insets(radius, h):
+    """Per-row inset of a box h rows tall with rounded corners: R - round(sqrt(R^2 - dy^2))."""
+    out = []
+    for y in range(h):
+        dy = max(radius - y, y - (h - 1 - radius), 0)
+        out.append(radius - round(math.sqrt(max(radius * radius - dy * dy, 0))) if dy else 0)
+    return out
+
+
+def shape_spans(pw, ph, radius):
+    """Bounding-shape rectangles (x, y, w, h) of the rounded popup; equal rows merged."""
+    spans = []
+    for y, inset in enumerate(corner_insets(radius, ph)):
+        if pw - 2 * inset <= 0:
+            continue
+        if spans and spans[-1][0] == inset and spans[-1][1] + spans[-1][3] == y:
+            x0, y0, w0, h0 = spans[-1]
+            spans[-1] = (x0, y0, w0, h0 + 1)
+        else:
+            spans.append((inset, y, pw - 2 * inset, 1))
+    return spans
+
+
+def draw(lay, rows, pw, ph, m):
+    """Render rows into a pw x ph RGB24 surface: border, rounded background, text.
+    Anything beyond pw x ph is clipped."""
+    import cairo
+    surf = cairo.ImageSurface(cairo.FORMAT_RGB24, pw, ph)
+    cr = cairo.Context(surf)
+    cr.set_source_rgb(*rgb(BORDER))
+    cr.paint()
+    cr.set_source_rgb(*rgb(BG))
+    for x, y, w, h in shape_spans(pw - 2 * BORDER_W, ph - 2 * BORDER_W, max(m.radius - BORDER_W, 0)):
+        cr.rectangle(x + BORDER_W, y + BORDER_W, w, h)
+    cr.fill()
+    y = m.pad_y + lay.ascent
+    for r, row_xs in zip(rows, lay.xs):
+        set_font(cr, m, r.bold)
+        for cell, x in zip(r.cells, row_xs):
+            cr.move_to(x, y)
+            for text, color in cell:
+                cr.set_source_rgb(*rgb(color or TEXT))
+                cr.show_text(text)
+        y += lay.line_h
+    surf.flush()
+    return surf
+
+
+def pick_monitor(item, monitors):
+    """The monitor that contains the item's centre, else the first one."""
+    ix, iy, iw, ih = item
+    cx, cy = ix + iw // 2, iy + ih // 2
+    for mon in monitors:
+        mx, my, mw, mh = mon
+        if mx <= cx < mx + mw and my <= cy < my + mh:
+            return mon
+    return monitors[0]
+
+
+def place(item, panel, mon, pw, ph):
+    """Popup origin (D-53): beside the item, away from the panel's screen edge, clamped
+    into the monitor. Orientation comes from the panel's shape, the side from which
+    half of the monitor the panel's centre is in (no nearest-edge rule)."""
+    ix, iy, iw, ih = item
+    px, py, ppw, pph = panel
+    mx, my, mw, mh = mon
+    if ppw >= pph:
+        x = max(mx + MARGIN, min(ix + iw // 2 - pw // 2, mx + mw - pw - MARGIN))
+        y = iy + ih + GAP if py + pph / 2 < my + mh / 2 else iy - ph - GAP
+    else:
+        y = max(my + MARGIN, min(iy + ih // 2 - ph // 2, my + mh - ph - MARGIN))
+        x = ix + iw + GAP if px + ppw / 2 < mx + mw / 2 else ix - pw - GAP
+    return x, y
+
+
+# --------------------------------------------------------------------------
+# X bindings and handlers
+# --------------------------------------------------------------------------
+
+class Lib:
+    """One shared library with every function of its LIBS entry bound (SEC-03)."""
+
+    def __init__(self, soname, protos):
+        dll = ctypes.CDLL(soname)
+        for name, restype, *argtypes in protos:
+            proto(self, dll, name, restype, *argtypes)
+
+
+def proto(lib, dll, name, restype, *argtypes):
+    """Bind dll.name onto lib with its restype and argtypes set; nothing is ever called unbound."""
+    fn = getattr(dll, name)
+    fn.restype, fn.argtypes = restype, list(argtypes)
+    setattr(lib, name, fn)
+
+
+def load_libs():
+    """{key: Lib or None}; None when a required library or symbol is missing. A missing
+    optional one is logged and degrades: no raw-button hide (Xi), root as the only monitor."""
+    out = {}
+    for key, (soname, required, protos) in LIBS.items():
+        try:
+            out[key] = Lib(soname, protos)
+        except (OSError, AttributeError) as e:
+            if required:
+                return None
+            log_once(f"lib:{key}", f"{soname} unavailable, degraded: {e!r}")
+            out[key] = None
+    return out
+
+
+XERRORS = {"count": 0, "resource": 0}
+
+
+def _on_x_error(display, event):
+    """Count X errors and note the failing resource; never exit (SEC-03)."""
+    XERRORS["count"] += 1
+    XERRORS["resource"] = event.contents.resourceid
+    return 0
+
+
+def _on_x_io_error(display):
+    """The display is gone: Xlib would exit() after this returns, so leave first."""
+    remove_pidfile()
+    os._exit(EXIT_UNAVAILABLE)
+
+
+X_ERROR_HANDLER = XErrorHandler(_on_x_error)          # module level: must outlive every call
+X_IO_ERROR_HANDLER = XIOErrorHandler(_on_x_io_error)
+
+
+class Popup:
+    """The popup window and the hover state machine of D-49 for one X connection."""
+
+    def __init__(self, libs, dpy):
+        self.L, self.X, self.dpy = libs, libs["X"], dpy
+        scr = self.X.XDefaultScreen(dpy)
+        self.root = self.X.XRootWindow(dpy, scr)
+        self.visual = self.X.XDefaultVisual(dpy, scr)
+        self.depth = self.X.XDefaultDepth(dpy, scr)
+        self.metrics = Metrics(parse_dpi(self.X.XResourceManagerString(dpy)))
+        self.win = self.gc = None
+        self.xi_opcode = None
+        self.state, self.deadline = DETACHED, time.monotonic()
+        self.sock, self.size, self.mask = None, (0, 0), None
+        self.host_fd = None          # pidfd of the item's genmon wrapper; readable once the item is gone
+        self.geo = None              # (item, panel, monitor) while shown; None = read again (D-48)
+        self.frame = None            # (panel rect, monitors) for one show: an item move changes neither
+        self.mapped = self.raw_on = False
+        self.rows, self.version, self.drawn, self.doc_key = None, 0, -1, None
+        self.seen_errors = 0
+        self.env_xid = self._env_xid()
+        self.env_monitors = self._env_monitors()
+
+    # ---- setup ----
+    def usable(self):
+        """TrueColor 0xff0000/0xff00/0xff visual with a 32 bpp pixmap format, and the
+        Shape extension: what cairo RGB24 and the input-transparent window need (SEC-03)."""
+        v = self.visual.contents
+        if v.class_ != TrueColor or (v.red_mask, v.green_mask, v.blue_mask) != RGB_MASKS:
+            return False
+        n = c_int()
+        fmts = self.X.XListPixmapFormats(self.dpy, ctypes.byref(n))
+        if not fmts:
+            return False
+        ok = any(fmts[i].depth == self.depth and fmts[i].bits_per_pixel == IMAGE_BPP
+                 for i in range(n.value))
+        self.X.XFree(fmts)
+        ev, err = c_int(), c_int()
+        return ok and bool(self.L["Xext"].XShapeQueryExtension(self.dpy, ctypes.byref(ev),
+                                                               ctypes.byref(err)))
+
+    def create_window(self):
+        """One override-redirect tooltip window, empty input shape: no taskbar or pager
+        entry, no focus, and every click falls through to what is below (D-53)."""
+        X, dpy = self.X, self.dpy
+        a = XSetWindowAttributes()
+        a.background_pixel, a.border_pixel, a.override_redirect = int(BG, 16), 0, 1
+        self.win = X.XCreateWindow(dpy, self.root, 0, 0, 1, 1, 0, 0, InputOutput, None,
+                                   CWBackPixel | CWBorderPixel | CWOverrideRedirect, ctypes.byref(a))
+        name = b"panelgraph-popup"
+        X.XStoreName(dpy, self.win, name)
+        self._set_prop(b"_NET_WM_NAME", X.XInternAtom(dpy, b"UTF8_STRING", 0), PROP_FORMAT_8, name,
+                       len(name))
+        cls = b"panelgraph-popup\0Panelgraph-popup\0"
+        self._set_prop(b"WM_CLASS", XA_STRING, PROP_FORMAT_8, cls, len(cls))
+        tip = (c_ulong * 1)(X.XInternAtom(dpy, b"_NET_WM_WINDOW_TYPE_TOOLTIP", 0))
+        self._set_prop(b"_NET_WM_WINDOW_TYPE", XA_ATOM, PROP_FORMAT_32, tip, 1)
+        self.L["Xext"].XShapeCombineRectangles(dpy, self.win, ShapeInput, 0, 0, None, 0,
+                                               ShapeSet, Unsorted)
+        self.gc = X.XCreateGC(dpy, self.win, 0, None)
+
+    def _set_prop(self, prop, ptype, fmt, data, n):
+        """Replace one property of the helper's own window; never touches another client's window."""
+        X = self.X
+        X.XChangeProperty(self.dpy, self.win, X.XInternAtom(self.dpy, prop, 0), ptype, fmt,
+                          PropModeReplace, data, n)
+
+    def init_xi(self):
+        """XInput 2.2 for the raw button events that hide the popup on a click (D-49).
+        Without it the feature degrades: the popup then only hides on Leave."""
+        xi = self.L["Xi"]
+        op, ev, err = c_int(), c_int(), c_int()
+        if xi is None or not self.X.XQueryExtension(self.dpy, b"XInputExtension", ctypes.byref(op),
+                                                    ctypes.byref(ev), ctypes.byref(err)):
+            log_once("xi", "XInput2 unavailable: a click will not hide the popup")
+            return
+        major, minor = c_int(XI_VERSION[0]), c_int(XI_VERSION[1])
+        if xi.XIQueryVersion(self.dpy, ctypes.byref(major), ctypes.byref(minor)) != X_SUCCESS \
+                or (major.value, minor.value) < XI_VERSION:
+            log_once("xi", "XInput 2.2 unavailable: a click will not hide the popup")
+            return
+        self.xi_opcode = op.value
+
+    def _env_xid(self):
+        if not POPUP_XID_ENV:
+            return None
+        xid = parse_xid(POPUP_XID_ENV)
+        if xid is None:
+            log_once("env:xid", "PANELGRAPH_POPUP_XID is not a window id; ignored")
+        return xid
+
+    def _env_monitors(self):
+        if not MONITORS_ENV:
+            return None
+        mons = parse_monitors(MONITORS_ENV)
+        if mons is None:
+            log_once("env:monitors", "PANELGRAPH_POPUP_MONITORS is malformed; ignored")
+        return mons
+
+    # ---- the panel item ----
+    def find_item(self):
+        """(socket XID, pidfd of its wrapper or None): the env override, else the validated
+        net.host lookup; (None, None) when there is no item to attach to."""
+        if self.env_xid is not None:
+            return self.env_xid, None
+        pid = read_host_pid()
+        if pid is None:
+            return None, None
+        try:
+            fd = os.pidfd_open(pid)
+        except OSError:
+            return None, None
+        xid = resolve_host(pid)      # checked after pidfd_open, so the fd names the process checked
+        if xid is None:
+            os.close(fd)
+            return None, None
+        return xid, fd
+
+    def select_item(self, xid, mask):
+        """Select mask on the item's socket: the only foreign window the helper selects on (SEC-04)."""
+        self.X.XSelectInput(self.dpy, xid, mask)
+        self.mask = mask
+
+    def watch(self, xid):
+        """Select the hidden-state crossings on xid; True only if the window exists (no X error)."""
+        before = XERRORS["count"]
+        self.select_item(xid, ITEM_MASK_HIDDEN)
+        wa = XWindowAttributes()
+        if not self.X.XGetWindowAttributes(self.dpy, xid, ctypes.byref(wa)) or XERRORS["count"] != before:
+            return False
+        self.size = (wa.width, wa.height)
+        return True
+
+    def attach(self, now):
+        """Watch the item and go IDLE (PENDING if the pointer is already on it); while the item is
+        not found, stay DETACHED and retry in ATTACH_RETRY."""
+        xid, fd = self.find_item()
+        if xid is None or not self.watch(xid):
+            if fd is not None:
+                os.close(fd)
+            log_once("attach", "panel item not found; retrying every 2 s")
+            self.deadline = now + ATTACH_RETRY
+            return
+        self.sock, self.host_fd, self.state, self.deadline = xid, fd, IDLE, None
+        self.seen_errors = XERRORS["count"]
+        if self.pointer_inside():
+            self.begin_pending(now)
+
+    def detach(self):
+        """Hide, deselect and forget the item and its wrapper pidfd, and make the re-attach timer
+        due at once; no event on the old socket wakes us while detached (AC-91)."""
+        if self.sock is not None and self.mask not in (None, NoEventMask):
+            # The panel keeps the socket for a respawned wrapper, so a stale selection would keep
+            # waking us; a BadWindow on a socket that is already gone is expected (D-58).
+            self.select_item(self.sock, NoEventMask)
+            self.X.XSync(self.dpy, False)
+            self.seen_errors = XERRORS["count"]
+        self.mask = None
+        self.hide(DETACHED)
+        if self.host_fd is not None:
+            os.close(self.host_fd)
+        self.sock, self.host_fd, self.deadline = None, None, time.monotonic()
+
+    def pointer_inside(self):
+        """XQueryPointer on the item; a False result (other screen) counts as outside (SEC-10)."""
+        r, ch, mask = c_ulong(), c_ulong(), c_uint()
+        rx, ry, wx, wy = c_int(), c_int(), c_int(), c_int()
+        same = self.X.XQueryPointer(self.dpy, self.sock, ctypes.byref(r), ctypes.byref(ch),
+                                    ctypes.byref(rx), ctypes.byref(ry), ctypes.byref(wx),
+                                    ctypes.byref(wy), ctypes.byref(mask))
+        w, h = self.size
+        return bool(same) and 0 <= wx.value < w and 0 <= wy.value < h
+
+    def abs_rect(self, w):
+        """(x, y, w, h) of window w in root coordinates, or None if it is gone."""
+        wa, x, y, child = XWindowAttributes(), c_int(), c_int(), c_ulong()
+        if not self.X.XGetWindowAttributes(self.dpy, w, ctypes.byref(wa)):
+            return None
+        if not self.X.XTranslateCoordinates(self.dpy, w, self.root, 0, 0, ctypes.byref(x),
+                                            ctypes.byref(y), ctypes.byref(child)):
+            return None
+        return x.value, y.value, wa.width, wa.height
+
+    def panel_window(self):
+        """The item's top-level ancestor (the panel), found with XQueryTree."""
+        w = self.sock
+        while True:
+            r, parent, kids, n = c_ulong(), c_ulong(), P(c_ulong)(), c_uint()
+            if not self.X.XQueryTree(self.dpy, w, ctypes.byref(r), ctypes.byref(parent),
+                                     ctypes.byref(kids), ctypes.byref(n)):
+                return None
+            if kids:
+                self.X.XFree(kids)
+            if parent.value in (0, r.value):
+                return w
+            w = parent.value
+
+    def monitors(self):
+        """Monitor rects: the env override, else Xinerama, else RandR, else the root."""
+        if self.env_monitors:
+            return self.env_monitors
+        out, n = [], c_int()
+        xin, xrr = self.L["Xinerama"], self.L["Xrandr"]
+        if xin is not None and xin.XineramaIsActive(self.dpy):
+            s = xin.XineramaQueryScreens(self.dpy, ctypes.byref(n))
+            if s:
+                out = [(s[i].x_org, s[i].y_org, s[i].width, s[i].height) for i in range(n.value)]
+                self.X.XFree(s)
+        if not out and xrr is not None:
+            m = xrr.XRRGetMonitors(self.dpy, self.root, 1, ctypes.byref(n))
+            if m:
+                out = [(m[i].x, m[i].y, m[i].width, m[i].height) for i in range(n.value)]
+                xrr.XRRFreeMonitors(m)
+        return [r for r in out if r[2] > 0 and r[3] > 0] or [self.abs_rect(self.root)]
+
+    def geometry(self):
+        """(item, panel, monitor) rects in root coordinates, or None. The item is read now (D-48);
+        the panel and monitors once per show (D-58). Also refreshes the size pointer_inside() uses,
+        which no ConfigureNotify keeps current while hidden."""
+        item = self.abs_rect(self.sock)
+        if item is None:
+            return None
+        self.size = item[2:]
+        if self.frame is None:
+            top = self.panel_window()
+            self.frame = ((self.abs_rect(top) if top else None) or item), self.monitors()
+        panel, mons = self.frame
+        return item, panel, pick_monitor(item, mons)
+
+    # ---- drawing ----
+    def render(self, rows):
+        """Draw rows and put the window at its place; False keeps the previous state. The
+        geometry is read once per show and after a ConfigureNotify, not per redraw (D-58)."""
+        try:
+            lay = layout(rows, self.metrics)
+            if self.geo is None:
+                self.geo = self.geometry()
+            if self.geo is None:
+                return False
+            item, panel, mon = self.geo
+            pw = max(1, min(lay.width, mon[2] - 2 * MARGIN, SURF_MAX_W))
+            ph = max(1, min(lay.height, mon[3] - 2 * MARGIN, SURF_MAX_H))
+            surf = draw(lay, rows, pw, ph, self.metrics)
+        except Exception as e:
+            log_once("render", repr(e))
+            return False
+        try:
+            x, y = place(item, panel, mon, pw, ph)
+        except Exception as e:
+            log_once("place", repr(e))
+            return False
+        try:
+            self.upload(surf, x, y, pw, ph)
+        except Exception as e:
+            log_once("render", repr(e))
+            return False
+        self.drawn = self.version
+        return True
+
+    def upload(self, surf, x, y, pw, ph):
+        """Copy the surface into a pixmap, make it the window background, move and shape
+        the window. The surface buffer stays ours: Xlib only reads it (SEC-03)."""
+        X, dpy = self.X, self.dpy
+        data = surf.get_data()
+        buf = (ctypes.c_char * len(data)).from_buffer(data)
+        img = X.XCreateImage(dpy, self.visual, self.depth, ZPixmap, 0, buf, pw, ph, IMAGE_BPP,
+                             surf.get_stride())
+        if not img:
+            return
+        img.contents.byte_order = HOST_BYTE_ORDER    # cairo writes native-endian pixels
+        pm = X.XCreatePixmap(dpy, self.win, pw, ph, self.depth)
+        X.XPutImage(dpy, pm, self.gc, img, 0, 0, 0, 0, pw, ph)
+        img.contents.data = None                     # never XDestroyImage: the buffer is cairo's
+        X.XFree(img)
+        X.XSetWindowBackgroundPixmap(dpy, self.win, pm)
+        X.XFreePixmap(dpy, pm)                       # the window keeps its own reference
+        X.XMoveResizeWindow(dpy, self.win, x, y, pw, ph)
+        spans = shape_spans(pw, ph, self.metrics.radius)
+        rects = (XRectangle * len(spans))(*(XRectangle(*s) for s in spans))
+        self.L["Xext"].XShapeCombineRectangles(dpy, self.win, ShapeBounding, 0, 0, rects, len(spans),
+                                               ShapeSet, Unsorted)
+        X.XClearWindow(dpy, self.win)
+
+    def load(self):
+        """The newest valid popup.json rows, else the last good ones (SEC-05)."""
+        try:
+            st = os.stat(POPUP_JSON, follow_symlinks=False)
+            key = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            key = None
+        if key != self.doc_key:
+            self.doc_key = key
+            rows = parse_doc(read_capped(POPUP_JSON, DOC_MAX)) if key else ()
+            if rows:
+                self.rows, self.version = rows, self.version + 1
+            elif rows is None:
+                log_once("doc", "popup.json invalid or too large; keeping the last good content")
+        return self.rows
+
+    # ---- state machine (D-49) ----
+    def raw_buttons(self, on):
+        """Raw button presses on root, selected only while pending or shown."""
+        if self.xi_opcode is None or on == self.raw_on:
+            return
+        bits = (ctypes.c_ubyte * XI_MASK_LEN)()
+        if on:
+            bits[XI_RawButtonPress >> 3] |= 1 << (XI_RawButtonPress & 7)
+        mask = XIEventMask(XIAllMasterDevices, XI_MASK_LEN, bits)
+        self.L["Xi"].XISelectEvents(self.dpy, self.root, ctypes.byref(mask), 1)
+        self.raw_on = on
+
+    def begin_pending(self, now):
+        """Start the hover delay: the popup shows at now + SHOW_DELAY unless the pointer leaves or clicks."""
+        self.state, self.deadline = PENDING, now + SHOW_DELAY
+        self.raw_buttons(True)
+
+    def hide(self, state):
+        """Unmap if mapped, stop raw button and structure events and enter state with no timer pending."""
+        if self.mapped:
+            self.X.XUnmapWindow(self.dpy, self.win)
+            self.mapped = False
+        self.raw_buttons(False)
+        if self.mask == ITEM_MASK_SHOWN:
+            self.select_item(self.sock, ITEM_MASK_HIDDEN)
+        self.state, self.deadline, self.geo, self.frame = state, None, None, None
+
+    def show(self, now):
+        """End of the hover delay: map with fresh content and geometry, or retry in REFRESH."""
+        self.frame = None            # panel and monitors are read at show time too (D-48)
+        # before the rect read, so any move after it is reported (AC-86, D-58)
+        self.select_item(self.sock, ITEM_MASK_SHOWN)
+        self.geo = self.geometry()   # also the size pointer_inside() needs
+        if self.geo is None or not self.pointer_inside():
+            self.hide(IDLE)
+            return
+        rows = self.load()
+        if rows and self.render(rows):
+            self.X.XMapRaised(self.dpy, self.win)     # the only raise: updates never re-raise
+            self.mapped, self.state = True, SHOWN
+        else:
+            self.select_item(self.sock, ITEM_MASK_HIDDEN)   # PENDING retry: no relayout wakeups (D-58)
+        self.deadline = now + REFRESH
+
+    def refresh(self, now):
+        """While shown: hide if the pointer left unseen (SEC-10), redraw if the rows changed."""
+        if not self.pointer_inside():
+            self.hide(IDLE)
+            return
+        rows = self.load()
+        if rows and self.version != self.drawn:
+            self.render(rows)
+        self.deadline = now + REFRESH
+
+    def on_timer(self, now):
+        """Run the one due timer of the current state; there is none while IDLE or SUPPRESSED."""
+        if self.deadline is None or now < self.deadline:
+            return
+        if self.state == DETACHED:
+            self.attach(now)
+        elif self.state == PENDING:
+            self.show(now)
+        elif self.state == SHOWN:
+            self.refresh(now)
+        else:
+            self.deadline = None
+
+    def check_errors(self):
+        """An X error on the item's window means it is gone: detach and look again."""
+        if XERRORS["count"] == self.seen_errors:
+            return
+        self.seen_errors = XERRORS["count"]
+        if self.sock is not None and XERRORS["resource"] == self.sock:
+            self.detach()
+
+    def on_generic(self, ev):
+        """An XI2 raw button press while PENDING or SHOWN hides until the next real Leave (D-49);
+        other generic events are ignored. The event data is always freed."""
+        cookie = ev.xcookie
+        if self.xi_opcode is None or cookie.extension != self.xi_opcode:
+            return
+        if not self.X.XGetEventData(self.dpy, ctypes.byref(cookie)):
+            return
+        if cookie.evtype == XI_RawButtonPress and self.state in (PENDING, SHOWN):
+            self.hide(SUPPRESSED)                    # until the next real Leave (D-49)
+        self.X.XFreeEventData(self.dpy, ctypes.byref(cookie))
+
+    def dispatch(self, ev):
+        """One X event. Synthetic events are dropped, so another client cannot fake a
+        hover (SEC-04); crossing and structure events count only for the item."""
+        t = ev.type
+        if t == GenericEvent:
+            self.on_generic(ev)
+            return
+        if ev.xany.send_event or self.sock is None or ev.xany.window != self.sock:
+            return
+        if t == EnterNotify:
+            if self.state == IDLE:                   # not PENDING/SHOWN: Inferior returns (A4)
+                self.begin_pending(time.monotonic())
+        elif t == LeaveNotify:
+            c = ev.xcrossing
+            if c.mode == NotifyGrab or c.detail != NotifyInferior:
+                self.hide(IDLE)
+        elif t == ConfigureNotify:
+            self.size = (ev.xconfigure.width, ev.xconfigure.height)
+            if self.state == SHOWN:
+                self.geo, self.drawn = None, -1     # re-placed at the next refresh, once per burst (D-58)
+        elif t in (DestroyNotify, UnmapNotify):
+            self.detach()
+
+    def loop(self, pidfd):
+        """Serve events and timers until the daemon exits; no timer while idle (D-49). The
+        wrapper's pidfd turning readable means the item is gone (D-58)."""
+        X, dpy = self.X, self.dpy
+        xfd = X.XConnectionNumber(dpy)
+        ev = XEvent()
+        while True:
+            while X.XPending(dpy):
+                X.XNextEvent(dpy, ctypes.byref(ev))
+                self.dispatch(ev)
+            self.check_errors()
+            self.on_timer(time.monotonic())
+            X.XFlush(dpy)
+            if X.XPending(dpy):
+                continue
+            timeout = None if self.deadline is None else max(0.0, self.deadline - time.monotonic())
+            fds = [xfd, pidfd] if self.host_fd is None else [xfd, pidfd, self.host_fd]
+            ready, _, _ = select.select(fds, [], [], timeout)
+            if pidfd in ready:
+                return EXIT_OK
+            if self.host_fd is not None and self.host_fd in ready:
+                self.detach()
+
+
+def open_popup(libs):
+    """Connect to $DISPLAY and build the popup, or None when X is unusable."""
+    X = libs["X"]
+    X.XSetErrorHandler(X_ERROR_HANDLER)
+    X.XSetIOErrorHandler(X_IO_ERROR_HANDLER)
+    dpy = X.XOpenDisplay(None)
+    if not dpy:
+        log_once("x", f"cannot open display {os.environ.get('DISPLAY', '')!r}")
+        return None
+    popup = Popup(libs, dpy)
+    if not popup.usable():
+        log_once("x", "unsupported visual, pixmap format or no Shape extension")
+        return None
+    popup.create_window()
+    popup.init_xi()
+    return popup
+
+
+def serve():
+    """Steps 8-11 of the startup order (SEC-09), then the event loop."""
+    dpid = parse_pid(DAEMON_PID_ENV)
+    if dpid is None:
+        return EXIT_UNAVAILABLE
+    try:
+        pidfd = os.pidfd_open(dpid)
+    except ProcessLookupError:
+        return EXIT_OK
+    except OSError:
+        return EXIT_UNAVAILABLE
+    libs = load_libs()
+    if libs is None:
+        log_once("x", "libX11, libXext or libc not loadable")
+        return EXIT_UNAVAILABLE
+    libs["libc"].prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    if os.getppid() != dpid:
+        return EXIT_OK               # the daemon died before PDEATHSIG was armed
+    popup = open_popup(libs)
+    if popup is None:
+        return EXIT_UNAVAILABLE
+    return popup.loop(pidfd)
+
+
+def main():
+    os.closerange(3, os.sysconf("SC_OPEN_MAX"))
+    try:
+        if not secure_dir():
+            return EXIT_UNAVAILABLE
+        os.chdir(DIR)
+        lock = open(POPUP_LOCK, "w")
+    except OSError:
+        return EXIT_UNAVAILABLE
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return EXIT_BUSY
+    try:
+        with open("/proc/self/comm", "w") as f:
+            f.write(PROC_NAME)
+        write_atomic(POPUP_PID, str(os.getpid()))
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(EXIT_OK))
+        return serve()
+    except Exception:
+        log_once("crash", traceback.format_exc())
+        return EXIT_CRASH
+    finally:
+        remove_pidfile()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,10 +1,10 @@
 # panelgraph NETWORK graph: requirements
 
-Version 1.3, 2026-11-20. Author: Business Analyst (BA). v1.3: user accepted all RECOMMENDED options (§5); AC-10 and AC-52 test methods fixed.
+Version 1.4, 2026-11-27. v1.4: own hover popup (R11, F-25, DEF-06), private runtime dir (F-26, DEF-07), text sanitising `clean()` (D-56), iw drain to EOF (D-57), no idle wakeups from panel relayouts (D-58); decisions D-46 to D-58; design §4.7; ACs AC-80 to AC-99 (see §9). Version 1.3, 2026-11-20. Author: Business Analyst (BA). v1.3: user accepted all RECOMMENDED options (§5); AC-10 and AC-52 test methods fixed.
 Sources: user requests R3-R10 and NFRs; user decisions (a)-(c); the cyber security specialist's QA consultation on WLAN monitor mode (v1.2; see section 8 and `qa-instructions.md` §11); the networking and cyber security specialists' assessments, their two rounds of answers and their sign-off corrections (v1.1, see section 9); the BA's read-only checks of `~/.local/bin/panelgraph-daemon` (392 lines), `~/.local/bin/panelgraph-show` (27 lines), live sysfs/proc and xfconf on 2026-11-20.
 
 This file is the single source of truth, together with:
-- `acceptance-criteria.md`: AC-01 to AC-79. Every AC id cited here is defined there. Its "coverage map" lists the sandbox and live ACs for each aspect of the monitor-mode colour decision.
+- `acceptance-criteria.md`: AC-01 to AC-99. Every AC id cited here is defined there. Its "coverage map" lists the sandbox and live ACs for each aspect of the monitor-mode colour decision.
 - `dev-instructions.md`: how to build it.
 - `qa-instructions.md`: how to verify it, including the security specialist's QA consultation (§11, "WLAN monitor mode testing").
 
@@ -17,13 +17,14 @@ Where these documents disagree with the interview transcript, these documents wi
 The panel graph is a cpugraph-style history of network load in the user's Xfce top panel.
 - Panel: 34 px tall, X11 `:0`, 1920x1080. OS: Kali Linux, `/bin/sh` = dash.
 - Panel item: xfce4-genmon-plugin 4.3, item 26, wrapper `wrapper-2.0 ... libgenmon.so 26`.
-- Position: socket window 0x60000e, 142x34 at screen x=1321, y=0. The image is drawn at screen x 1322-1461, y 1-32.
-- Neighbours: the cpugraph (plugin 13) to its left. Netload plugins 24 (wlan0) and 23 (wlan1) to its right, at x=1463 and x=1511.
+- Position: a 142x34 socket window in the top panel; the image is drawn 1 px inside it. The position changes whenever the panel is rearranged (it has moved since v1.3), so nothing may hard-code coordinates: tools resolve the item at run time through `net.host` (§4.7) or the /proc wrapper scan (`qa-instructions.md` §3).
+- Neighbours (v1.3): the cpugraph (plugin 13) to its left. A second genmon item (plugin 15) also runs on the panel.
 
 | Component | Role |
 |---|---|
-| `~/.local/bin/panelgraph-daemon` | Python 3.14 + pycairo 1.29.1. Samples every 250 ms and writes `{mem,net}.{png,txt}` to `/run/user/1000/panelgraph/`. |
-| `~/.local/bin/panelgraph-show net` | Run by genmon every 250 ms. Prints the genmon markup and starts the daemon if needed. |
+| `~/.local/bin/panelgraph-daemon` | Python 3.14 + pycairo 1.29.1. Samples every 250 ms and writes `{mem,net}.{png,txt}` to `$XDG_RUNTIME_DIR/panelgraph/`. Starts and feeds the popup helper; never uses X itself. |
+| `~/.local/bin/panelgraph-show net` | Run by genmon every 250 ms. Prints the genmon markup, records its parent (the genmon wrapper) in `net.host`, and starts the daemon if needed. |
+| `~/.local/bin/panelgraph-popup` | Hover popup helper (F-25), started by the daemon. ctypes libX11/libXext/libXi/libXinerama/libXrandr + pycairo. |
 
 The user's laptop is a pentest machine:
 - Monitor mode (airmon-ng, giving wlan0mon/wlan1mon), VPNs, USB Wi-Fi or tethering, and lab bridges (docker0, virbr0, virbr-msf, vnet*) are normal.
@@ -71,6 +72,7 @@ The user's laptop is a pentest machine:
 | R8 | "how to display wlan0mon and wlan1mon if something is in monitoring mode. that should be visible to user." |
 | R9 | Security view: "what might be important to user to see ... to see strange activity" |
 | R10 | User request (verbatim): "add task fo cyber security agent to assist/consult QA on how to check WLAN in monitor mode. BA should document everything. In Monitor mode graph should dislpay traffic in a different collor." It led to UD-a, UD-b and UD-c below. |
+| R11 | Own hover popup (2026-11-27): the genmon tooltip never appears on the user's Kali panel. On hover over the network graph, show a small dark popup like the cpugraph tooltip listing the strip interfaces with down/up rates; it updates live while shown and disappears when the pointer leaves. |
 | UD-a | Monitor-mode traffic is drawn in a **different colour** from managed download #FF4F00 / upload #FFE500, clearly visible on the dark panel (bg ~#293650), and is **never** added to the managed sum. |
 | UD-b | The cyber security specialist consults QA on checking WLAN monitor mode. QA gets an unattended sandbox procedure, plus a live procedure that needs user approval. |
 | UD-c | The BA documents everything: current and future functions, decisions, the monitor colour design and the security QA guidance. |
@@ -200,6 +202,8 @@ Line numbers refer to the current `panelgraph-daemon`.
 | DOC-03 | A NIC moved into another network namespace disappears from the graph. Accepted. | [N] |
 | DOC-04 | Interfaces are tracked by name. A rename or fast replug is tolerated only through the `max(0, …)` clamp. Fix: F-16 (Should). | [N] |
 | DOC-05 | The daemon still renders `mem.{png,txt}` 4x/s although no panel item shows them. Accepted under the RAM deferral (OQ-9). | [BA] |
+| DEF-06 | **The genmon tooltip never appears at a period under about 0.5 s** (v1.4). genmon 4.3's `DisplayCmdOutput` calls `gtk_widget_set_tooltip_markup` on every poll, also when the text is unchanged, and also with its own default tooltip when there is no `<tool>`. In GTK 3.24 that setter queues a tooltip query, which synthesizes a motion event and restarts the 500 ms hover timeout while the tooltip is not yet shown. Reproduced on Xvfb with the live libgtk-3 build and a genmon-shaped widget: periods 250 ms (changing or identical text) and 400 ms never showed the tooltip in 5 s; 600 ms showed it after 1.0 s; 1000 ms after 0.8 s; 2000 ms after 1.8 s (always about 0.5 s after the last set). cpugraph does not re-set its tooltip every tick, so its tooltip works. Fix: F-25 (own popup); the period stays 0.25 s (D-46). | [BA] |
+| DEF-07 | **Shared `/tmp` fallback for the runtime dir** (v1.4). With `XDG_RUNTIME_DIR` unset the daemon and wrapper used `/tmp/panelgraph` without an owner or mode check. Another local user could pre-create it and plant a `<click>` command (run as the victim), truncate files through a symlinked `seen`, or forge the `gw.json` baseline. With the variable set but empty, the daemon used the relative `panelgraph` while the wrapper used `/tmp/panelgraph`, so the wrapper spawned a daemon on every call (NFR-3/NFR-4). Fix: F-26 (D-55). | [BA] |
 
 ### 3.10 Live security baseline observed (read-only) [S][BA]
 - `netdiscover` pid <pid> has been running about 22.5 h. Parent: sudo <ppid>. It holds 2 raw sockets on wlan0 and keeps wlan0 **promiscuous**: `/sys/class/net/wlan0/flags = 0x1103`, admin UP, operstate down, carrier_changes 25. `ip link` does **not** show PROMISC for socket-held promisc, so the sysfs `flags` file is the reliable source. User decision: OQ-4.
@@ -226,7 +230,13 @@ MoSCoW priority. One developer pass delivers all **Must** items. **Should** item
 | `PANELGRAPH_IW` | `shutil.which("iw")`, else `/usr/sbin/iw` | iw executable (genmon's PATH may lack /usr/sbin) |
 | `PANELGRAPH_ADDRS` | unset, meaning use the SIOCGIFADDR ioctl | file of `ifname a.b.c.d` lines, used instead of the ioctl (sandbox; real names like wlan1 would otherwise leak the live IP) |
 | `PANELGRAPH_ALERT_HOLD` | `600` (s) | M2 frame hold after the MAC returns to baseline |
-| `XDG_RUNTIME_DIR` | already supported | output dir `$XDG_RUNTIME_DIR/panelgraph` |
+| `XDG_RUNTIME_DIR` | **required** (v1.4, F-26) | output dir `$XDG_RUNTIME_DIR/panelgraph`. Must be an absolute path; there is no `/tmp` fallback. The dir must be a real directory owned by the user; it is created or forced to mode 0700. Set by systemd-logind on Kali. |
+| `PANELGRAPH_POPUP` | `1` | `0` disables the hover popup helper (F-25) |
+| `PANELGRAPH_POPUP_CMD` | `panelgraph-popup` next to the daemon | **test only.** Helper path; resolved at import (before the daemon chdirs) and must be absolute, otherwise the popup is disabled with one `net aux [popup]` log entry |
+| `PANELGRAPH_POPUP_XID` | unset | helper only: target window id (decimal or `0x` hex, 1..0x1FFFFFFF) instead of the `net.host` lookup; also lets the daemon start the helper before any `net.host` exists. Invalid values are logged to `popup.log` and ignored. Test only: it names no wrapper, so there is no pidfd and, while hidden, a vanished window is noticed only by the next X error naming it (§4.7.7). |
+| `PANELGRAPH_POPUP_MONITORS` | unset | helper only: `x,y,w,h;…` monitor rects instead of Xinerama/RandR. Malformed (non-int, w/h ≤ 0, \|value\| > 32767) → logged and ignored. Sandbox use. |
+| `PANELGRAPH_DAEMON_PID` | set by the daemon | helper only: the parent daemon's pid (`^[1-9][0-9]*$`); missing or invalid → helper exit 3 |
+| `DISPLAY` | inherited | the daemon starts the helper only when it is set |
 
 **Interface classification**, evaluated **every tick** (F-01) [N][S agreed]. `has_dev` = `<if>/device` exists; `has_phy` = `<if>/phy80211` exists.
 - Both links (and the phy name) are checked when a name is first seen, **and re-checked for every name in each 5 s slow scan**. Both positive and negative results are refreshed (D-32).
@@ -352,8 +362,8 @@ genmon 4.3 calls `gtk_widget_set_tooltip_markup` (libgenmon.so imports it) [N], 
 - SSID handling:
   1. Decode iw's `\xNN` escapes to bytes.
   2. UTF-8 decode with `errors="replace"`.
-  3. Remove control characters (Unicode category Cc, including newline).
-  4. Truncate to 32 characters.
+  3. Remove unsafe characters with `clean()` (v1.4, D-56): Unicode categories Cc (control, including newline), Cf (format: bidi overrides such as U+202E, zero-width U+200B), Cs, Co, Cn, Zl (U+2028) and Zp (U+2029).
+  4. Truncate to 32 characters (no ellipsis).
   5. Escape.
 - Rationale: the SSID is attacker-controlled. An unescaped `</tool><click>cmd</click>` would inject a genmon click command, and a bad `&` blanks the tooltip.
 
@@ -392,7 +402,7 @@ genmon 4.3 calls `gtk_widget_set_tooltip_markup` (libgenmon.so imports it) [N], 
 Notes on the strip lines:
 - `★` marks the default-route interface.
 - Signal comes from `/proc/net/wireless`, falling back to iw link. The interface column of `/proc/net/wireless` is right-aligned with leading spaces (live: ` wlan1: 0000   70.  -27. …`), so the name must be stripped before matching. Channel, frequency and width come from `iw dev`. Bitrates come from `iw link`, rounded to integers.
-- **SSID source** (D-35): the `ssid` line of `iw dev`; if `iw dev` has no `ssid` line for that interface, the `SSID:` line of `iw dev <if> link`. Both parsers pass the SSID through the **same** function: decode `\xNN` → UTF-8 with replace → strip Unicode Cc → truncate to 32 → escape (rules above). Both use iw's `\xNN` escaping, so both are attacker-controlled input.
+- **SSID source** (D-35): the `ssid` line of `iw dev`; if `iw dev` has no `ssid` line for that interface, the `SSID:` line of `iw dev <if> link`. Both parsers pass the SSID through the **same** function: decode `\xNN` → UTF-8 with replace → strip Cc/Cf/Cs/Co/Cn/Zl/Zp (`clean()`, D-56) → truncate to 32 → escape (rules above). Both use iw's `\xNN` escaping, so both are attacker-controlled input.
 - Unavailable Wi-Fi details: the last good values are kept with ` (stale Ns)` for up to 30 s. After that the line reads `wlan1 ★ Wi-Fi details unavailable (iw missing|timeout|parse)  ↓ … ↑ …`.
 - The `fr/s` figure comes from the monitor `rx_packets` delta (informational).
 
@@ -428,6 +438,8 @@ Idle-state wording for L10:
 | F-08 | **Gateway line** (M3 merged with R6) | R6, R9 | `Gateway <ip> <mac> via <if>, IP <addr>`. Default route = `/proc/net/route` row with Destination 00000000, Mask 00000000, flags & RTF_UP (0x1), lowest Metric. Gateway IP from the Gateway column if flags & RTF_GATEWAY (0x2), else `?`. MAC from the `/proc/net/arp` row with IP == gw, Device == iface, flags & 0x2, else `?`. | 5 s scan | S, N | AC-38, AC-39, AC-46 |
 | F-09 | **Gateway MAC change alert** (M2) | R9 | See 4.4. Red frame (#FF2020, 340 px, content inset) + `!!` line, persisted in `gw.json`, accepted via `rm`. | 5 s scan, plus one extra `iw link` on a first mismatch (rare) | S, N | AC-47 to AC-51 |
 | F-10 | **Robust auxiliary-data handling** | NFR-1, NFR-7 | iw, ioctl, route, arp and wireless failures never raise to the graph handler. Tooltip shows stale/unavailable markers. `error.log` gets one entry per distinct error key per 10 min, **without** the "!" marker. The "!" marker stays only for rendering/IO failures of the graph itself (as today). | – | N, BA | AC-41, AC-08 |
+| F-25 | **Hover popup** (v1.4, fixes DEF-06) | R11, NFR-1, NFR-4, NFR-7 | Separate helper `panelgraph-popup` (ctypes X + pycairo), started and fed by the daemon via `popup.json`; finds the item through `net.host`; event-driven Enter/Leave, 0.5 s delay, hides on Leave or any button; dark override-redirect, input-transparent window placed by panel orientation and monitor. Full design: §4.7. | helper hidden: 0 wakeups, also while the panel relayouts (D-58); shown: < 1 % of a core; daemon +≤ 65 µs/tick | BA | AC-80 to AC-92, AC-95 to AC-99; live AC-93 |
+| F-26 | **Private runtime dir** (v1.4, fixes DEF-07) | NFR-3, R9 | `XDG_RUNTIME_DIR` must be absolute; no `/tmp` fallback. Daemon and helper run `secure_dir()` first (umask 077; the dir must be a real directory owned by the user; mode forced to 0700) and otherwise exit (daemon 1, helper 3) without writing; the wrapper prints a "!" refusal line with builtins only. §4.7.1, D-55. | none | BA | AC-94 |
 
 #### SHOULD
 
@@ -455,6 +467,8 @@ Idle-state wording for L10:
 | F-22 | S3 desktop notification (`notify-send`) once per M2 event | OQ-5 | AC-64 |
 | F-23 | RAM graph | user deferral | AC-65 |
 | F-24 | genmon update period change | OQ-1 | AC-66 |
+
+F-24 stays deferred: the user chose F-25 (own popup) over a longer genmon period to fix DEF-06 (D-46).
 
 ### 4.4 F-09 gateway-MAC alert: full rule [S][N]
 
@@ -522,6 +536,97 @@ This is a summary card for Dev and QA. The binding detail is in 4.0 to 4.2.
 | Tooltip | `■ MONITOR <vif> (<phy>, ch<N> <F> MHz, up\|down)  ■ captured …  ■ injected …  … fr/s · not in total · Mon scale …`. Several vifs are joined by ` + `. After the last vif goes: `monitor ended HH:MM:SS` until the strip scrolls out (32-34 s). |
 | Not monitor | PROMISC never turns anything magenta (D-09); it is a tooltip line only. |
 | Verified by | Sandbox: AC-23 to AC-33, AC-37, AC-76 to AC-79 (`qa-instructions.md` §11.1 to §11.6). Live, requires user approval: AC-67, AC-68, AC-69 (§11.7); injection AC-75 is deferred (OQ-12). |
+
+### 4.7 F-25 hover popup and F-26 private runtime dir: design (v1.4)
+
+Binding design, from the architect's design as amended by the tech lead (A1-A11). Decisions D-46 to D-58. Verified by AC-80 to AC-99 (AC-93 live, APPROVAL).
+
+#### 4.7.1 Runtime dir (F-26, D-55). Prerequisite for everything below.
+- Resolver, byte-identical in the daemon and the helper (QA diffs the block): `_XDG = os.environ.get("XDG_RUNTIME_DIR") or ""`; `DIR = os.path.join(_XDG, "panelgraph") if os.path.isabs(_XDG) else None`. Every runtime path is derived only when `DIR` is set.
+- `secure_dir()`, also byte-identical: `umask(0o077)`; `DIR is None` → False; `makedirs(DIR, 0o700, exist_ok=True)`; `lstat(DIR)` must be a directory (a symlink fails) owned by `getuid()`; any group/other bit → `chmod(DIR, 0o700)`.
+- The daemon calls it first in `main()` after `closerange`; on False or OSError it returns 1 without writing anything. The helper exits 3.
+- `panelgraph-show` (builtins only): `case $XDG_RUNTIME_DIR in /*) d=…/panelgraph ;; *) echo "<txt>!</txt><tool>panelgraph: XDG_RUNTIME_DIR is not set</tool>"; exit 0 ;; esac`. It refuses first, so the daemon's refusal can never cause a respawn storm. This also covers "set but empty" and relative values.
+- Right after that `case`, before `seen`, `net.host` and the `.txt` read, the wrapper also refuses a `$d` that is a symlink or that exists and is not owned by the user: `if [ -h "$d" ] || { [ -e "$d" ] && ! [ -O "$d" ]; }; then echo "<txt>!</txt><tool>panelgraph: runtime dir is not private</tool>"; exit 0; fi`. Otherwise a dir planted in a shared `XDG_RUNTIME_DIR` would make it print another uid's `<click>` (run as the user) and write into that dir. The wrapper keeps no state, so the check runs on every call; `-h`/`-e`/`-O` are `test` builtins (measured +16 µs per call). A dir that does not exist yet passes, so the first start works: the daemon creates it with 0700.
+- Existing daemon files keep plain `open()`: once `DIR` is ours and 0700 inside an absolute runtime dir, no other uid can create entries there. New helper reads use `O_NOFOLLOW` anyway.
+
+#### 4.7.2 Files and process model
+- `bin/panelgraph-popup`: one executable Python ≥ 3.10 file; stdlib + `cairo` only (imported lazily). Importing it has no side effects (QA loads it with `SourceFileLoader`).
+- The daemon stays one file and X-free: it never imports ctypes, gi or any X library.
+- The daemon owns the helper; the wrapper never starts it, so the wrapper's hot path stays builtins-only.
+- `install.sh` copies three files.
+
+#### 4.7.3 Wrapper change (D-48)
+After the `seen` line: `[ "$1" = net ] && printf '%s\n' "$PPID" 2>/dev/null > "$d/net.host"`. genmon `execvp()`s the command directly, so `$PPID` is its wrapper (`wrapper-2.0 …/libgenmon.so <plugin-id> <socket-xid> genmon …`). Measured cost: +31 µs per call (dash, 3 × 4000 calls).
+
+#### 4.7.4 Daemon side (D-50, D-54)
+- `PopupHelper` with `poll(now)`, `alive()`, `feed(rows)`, `kill()`.
+- `poll(now)` runs on tick 0 and every `SLOW_EVERY` ticks (in the existing slow block, its own try/except → `log_once("popup", …)`). It reaps an exited child and sets `next_try` = the monotonic time `alive()` first saw the exit + backoff: rc 0 → 5 s, rc 2 → 5 s, rc 3 → 300 s, anything else (signals included) → 30 s; Popen `OSError` → 300 s. Exits other than 0/2 are logged. A new child starts only if `PANELGRAPH_POPUP` ≠ `0`, `DISPLAY` is set, `POPUP_CMD` is absolute, and `net.host` exists (or `PANELGRAPH_POPUP_XID` is set): `Popen([POPUP_CMD], stdin/stdout/stderr=DEVNULL, close_fds=True, start_new_session=True, env=… + PANELGRAPH_DAEMON_PID)`. At most one spawn per 5 s, never per tick (NFR-4).
+- `alive()` = one WNOHANG `waitpid` (about 1 µs), called every tick.
+- `run()`'s `finally` calls `kill()`: `killpg(SIGTERM)` if still running, no wait.
+- `feed(rows)` after `net.update()`, each tick, only while `alive()`: `json.dumps(…, ensure_ascii=False, separators=(",",":")) + "\n"`, written with `write_atomic` (`popup.json.tmp`) only when the text changed or the file is missing. Errors → `log_once("popup", …)`; never the "!" marker, never net.txt. When the net graph fails, a best-effort error doc is fed: one span row `panelgraph net error, see error.log`.
+- Measured per-tick cost: `popup_rows` 6 µs + `feed` 17 µs unchanged / 58 µs changed (dumps + tmpfs write) + `alive` 1 µs: ≤ 65 µs, 0.026 % of a core.
+
+#### 4.7.5 popup.json v1 (D-50)
+- `{"v":1,"rows":[ROW…]}`; `ROW = {"cells":[CELL…]}` plus `"bold":true` and/or `"free":true` (omitted when false); `CELL = [SEG…]`; `SEG = [text, colour]`, colour `null` or one of `FF4F00`, `FFE500`, `FF00FF`, `FFA0FF`.
+- Layout: 1 cell = span row (full width); several cells = table row (cell i aligned over all table rows); several cells with `free` = label in column 0, the rest flows after it. Column 0's width is the maximum over **all** multi-cell rows; columns ≥ 1 use table rows only.
+- `NetMonitor.popup_rows(managed, mon_active)` is called by `build()` with the same strips, order and current values as the image and the tooltip:
+  1. `gw.line` set → bold span row, `clean(line, 96)` (the `!!` row is about 86 characters).
+  2. Each managed strip → table row: label (name, then ` [AP]`/`[mesh]`/`[IBSS]`, ` ★` for the default route, ` (down)` under the tooltip's rule; `other: a+b` for the overflow strip) through `clean(label, 40)`; then `↓ ` (FF4F00) + rx, `↑ ` (FFE500) + tx, with `human(v, "B/s")`.
+  3. Monitor strip with vifs → free row: `+`-joined sorted vif names + ` (monitor)`; `↓ ` (FF00FF) `captured …`; `↑ ` (FFA0FF) `injected …` only if tx > 0.
+  4. Monitor strip from history only → span row `monitor ended HH:MM:SS`.
+  5. No strip at all → span row `No managed interface up` / `No network interfaces`.
+- At most 4 rows by construction (alert + 3 strips); the alert row is never dropped. No SSID, IP or MAC enters popup.json except inside `gw.line`. No markup: the helper draws literal text.
+
+#### 4.7.6 Helper: startup and lifecycle (D-54)
+Order: (1) `closerange(3, …)`; (2) umask 077 + resolver + `secure_dir()` (else exit 3); (3) `chdir(DIR)`; (4) `flock(popup.lock, LOCK_EX|LOCK_NB)` → exit 2 if busy; (5) comm `panelgraph-pop` (never `panelgraph`, which panelgraph-show and QA count as daemons); (6) atomic `popup.pid`; (7) SIGTERM → exit 0; (8) `PANELGRAPH_DAEMON_PID` must match `^[1-9][0-9]*$` (else exit 3); (9) `pidfd_open` (ProcessLookupError → exit 0); (10) `prctl(PR_SET_PDEATHSIG, SIGTERM)`, then exit 0 if `getppid()` is not that pid; (11) load the X libraries and `XOpenDisplay` (else exit 3), then the visual check (A7).
+- Exit codes: 0 daemon gone or SIGTERM; 1 unexpected exception (traceback in `popup.log`; the daemon retries after 30 s); 2 lock busy; 3 no display, missing X library, unsupported visual/pixmap format/no Shape extension, unusable runtime dir, or missing/invalid `PANELGRAPH_DAEMON_PID`. "Item not resolvable" is never an exit: the helper stays DETACHED.
+- It exits when the pidfd becomes readable (measured 0.03-0.04 s after the daemon's SIGTERM or SIGKILL), on SIGTERM, or on an X IO error (`popup.pid` removed if ours, `os._exit(3)`). It cannot be orphaned: pidfd + PDEATHSIG + the daemon's `killpg`.
+- It writes only `popup.pid(.tmp)`, `popup.lock` and `popup.log` (append, reset at 16 KiB, at most one entry per key per 10 min; each entry keeps its last 4096 code points). popup.log is the one file not written only through `write_atomic`: it is opened `O_APPEND|O_NOFOLLOW|O_NONBLOCK`, must be a regular file, and is restarted with `write_atomic` when an append would pass 16 KiB. It starts no processes; library sonames are loaded directly because `ctypes.util.find_library` would run `ldconfig`.
+
+#### 4.7.7 Helper: finding the item and input validation (D-48, SEC-02)
+- `PANELGRAPH_POPUP_XID` if valid; otherwise `net.host` → pid → `/proc/<pid>/cmdline`. Every file read: `open(O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK)`, `fstat` must be a regular file, read at most cap + 1 bytes (net.host 32 B, popup.json 16 KiB, cmdline 4 KiB); over the cap → ignored.
+- `net.host` must match `^[1-9][0-9]{0,9}\n?$`; `/proc/<pid>` must be owned by `getuid()`; argv has ≥ 4 elements, `basename(argv[0]) == "wrapper-2.0"`, `argv[1]` ends in `libgenmon.so`; `argv[3]` matches `^[1-9][0-9]*$` within 1..0x1FFFFFFF.
+- Then `XSelectInput(xid, EnterWindowMask|LeaveWindowMask)` (the hidden mask, D-58); `XGetWindowAttributes` must succeed with no X error. Initial inside state from `XQueryPointer`.
+- With the `net.host` lookup the helper also holds `pidfd_open(<wrapper pid>)`, opened before the cmdline check so the fd names the process that was checked. The pidfd turning readable (the wrapper exited: panel restart, item removed, plugin crash) → the socket is deselected and the helper goes DETACHED at once (D-58). `PANELGRAPH_POPUP_XID` names no wrapper, so it has no pidfd: there a vanished item is noticed only by the next X error naming it.
+- Geometry is read at show time, so a moved panel is handled.
+- **Known limitation (A11):** with two net panel items, `net.host` names whichever polled last. The helper attaches to one item and re-reads `net.host` only while DETACHED.
+- net.host is rewritten in place by the wrapper. A read that falls between truncate and write sees an empty file and delays attach by one ATTACH_RETRY (2 s); this is accepted.
+
+#### 4.7.8 Helper: hover state machine (D-49, A4, SEC-04, SEC-10)
+States DETACHED, IDLE, PENDING, SHOWN, SUPPRESSED.
+- Events with `send_event` ≠ 0 are dropped before dispatch, so another client cannot fake a hover.
+- DETACHED: retry the lookup every 2 s (its only timer); success → IDLE, or PENDING if the pointer is inside.
+- IDLE + EnterNotify on the item (any detail or mode) → PENDING: show at now + 0.5 s; select XI2 `XI_RawButtonPress` on root for all master devices. EnterNotify in any other state is ignored (a return from the plug child, detail Inferior, must not restart the delay).
+- LeaveNotify with mode NotifyGrab, or with any detail other than NotifyInferior → unmap, deselect raw events → IDLE.
+- PENDING deadline: `XQueryPointer` (a False result means outside → IDLE); load popup.json; valid v1 with ≥ 1 row → render, place, `XMapRaised` → SHOWN; otherwise retry every 0.25 s. `XMapRaised` is used only here; content updates never re-raise. StructureNotify is selected before the rects are read; it is dropped again if the popup does not map.
+- SHOWN, every 0.25 s: re-check the pointer (outside or False → IDLE, covers a missed Leave); `stat` popup.json (mtime, size, inode); if it changed, read, parse and redraw. Invalid docs keep the last good content.
+- Geometry while SHOWN (D-58): the item, panel and monitor rects are read once at show time, and redraws reuse them, so a redraw needs no X round trip besides the pointer check.
+- ConfigureNotify on the item while SHOWN → the next 0.25 s refresh reads the item rect again (the panel rect and monitors stay for the whole show) and redraws and re-places; a burst of moves costs one read.
+- `XI_RawButtonPress` (any button) in PENDING or SHOWN → unmap → SUPPRESSED until the next real Leave. XI 2.2 is required for raw events during grabs; without XI2 the click-hide degrades (logged once).
+- DestroyNotify/UnmapNotify on the item while SHOWN, the wrapper's pidfd turning readable, or an X error naming the item → unmap → DETACHED.
+- Event masks by state (D-58): IDLE, PENDING and SUPPRESSED select only Enter|Leave on the item; the show attempt at the PENDING deadline adds StructureNotify, and every hide or failed show drops it again. Going DETACHED deselects the socket (no mask): xfce4-panel keeps the socket for a respawned wrapper, so a stale selection would keep waking the detached helper; the BadWindow of a socket already gone is absorbed. The panel re-allocates the socket whenever any item relayouts (a variable-width label, a clock), and each such ConfigureNotify would wake the helper; while hidden only a crossing of the item, the wrapper's exit or the daemon's exit can wake it.
+- No timer in IDLE or SUPPRESSED. Bound while attached and hidden: 0 wakeups as long as the pointer does not cross the item, also while the panel relayouts (measured 0 context switches in 60 s with a neighbour item changing width every 0.25 s; 240 before D-58). DETACHED wakes only for its 2 s retry, also while the panel relayouts a kept socket (measured 10 context switches in 20 s under the relayout storm; 90 before the deselect). Shown: one `XQueryPointer` round trip per 0.25 s (measured 8 context switches/s with 4 Hz content, 20/s while the item also moves at 4 Hz).
+- Item loss while hidden is seen through the wrapper's exit (xfce4-panel 4.20.8 source): the panel keeps the socket when its wrapper exits and gives a respawned wrapper the same socket id (panel-plugin-external-wrapper-x11.c, plug_removed returns TRUE); when the item is removed or the panel restarts it sends the wrapper ACTION_QUIT or SIGTERM (panel_plugin_external_unrealize), and the wrapper quits when the panel's D-Bus name vanishes. Known limit: a hung wrapper that never handles QUIT outlives its socket; until it exits, the hidden helper stays on the dead window and a new net item gets no popup. No idle re-validation timer, by design (AC-90).
+- The helper never selects key, pointer-motion or button masks on any window, never grabs, warps or sets focus, and sends no events.
+- Loop: drain `XPending`/`XNextEvent`, check errors, run the timer, `XFlush`, then `select([xfd, daemon pidfd, wrapper pidfd], timeout)`.
+
+#### 4.7.9 Helper: window and drawing (D-52, D-53, SEC-03, SEC-05)
+- One window for the helper's life: `XCreateWindow` on root, default visual/depth, override-redirect, background #1C1C1E. `WM_NAME`/`_NET_WM_NAME` and `WM_CLASS` `panelgraph-popup`, `_NET_WM_WINDOW_TYPE_TOOLTIP`. Input shape empty (`XShapeCombineRectangles(ShapeInput, 0 rects)`), so the pointer and clicks pass through it.
+- Startup check: TrueColor visual with masks 0xff0000/0xff00/0xff, a 32 bpp pixmap format for the depth, and the Shape extension; else exit 3.
+- Rendering: pycairo `FORMAT_RGB24` surface → `XCreateImage(ZPixmap, data = the surface buffer, bytes_per_line = stride, byte_order = host)` → `XPutImage` into a pixmap → window background → `XClearWindow`. The image's `data` is set to NULL through a partial `XImage` struct before `XFree`; never `XDestroyImage`. Every Xlib list is freed (`XFree`, `XRRFreeMonitors`); `XResourceManagerString` is never freed. All ctypes functions come from one declaration table with `restype`/`argtypes`.
+- Look: background #1C1C1E, 1 px border #3A3A3C, text #E6E6E6; glyph colours only from the four graph colours, anything else drawn in the text colour; never #FF2020. Bold for `bold` rows. Cairo toy font "DejaVu Sans", 13 px; padding 10/6, column gap 14, line gap 3, corner radius 6, all scaled by `Xft.dpi`/96 (parsed defensively, finite, clamped 72-288, default 96). Grey text anti-aliasing (no subpixel colour fringes); the net.png no-AA and palette rules apply to net.png only.
+- Rounded corners by the bounding shape: per-row inset `R − round(sqrt(R² − dy²))`; no alpha visual, so pixels are the same with or without the compositor.
+- popup.json validation: `v` is the integer 1; at most 4 rows used; 1-4 cells per row; ≤ 4 segments per cell; text ≤ 128 code points; colour outside the whitelist → text colour; non-bool `bold`/`free` → false. Any other structural violation invalidates the whole doc (logged once; last good content kept, or stay hidden).
+- Surface clamp before allocation: width ≤ min(monitor − 8, 2048), height ≤ min(monitor − 8, 512); the rest is clipped. Load, render and place each sit in their own try/except; the loop never exits on them.
+
+#### 4.7.10 Placement (D-53)
+- Item rect R from `XTranslateCoordinates` + size; panel rect P = the item's top-level ancestor (`XQueryTree` walk); monitor M = the one containing R's centre, from `PANELGRAPH_POPUP_MONITORS`, else Xinerama (RandR-backed on Xorg ≥ 1.18), else `XRRGetMonitors`, else the root.
+- Horizontal panel (P.w ≥ P.h): x = clamp(R.cx − w/2, M.x + 4, M.x + M.w − w − 4); y = R.y + R.h + 4 if P's centre is in M's upper half, else R.y − h − 4.
+- Vertical panel: y = clamp(R.cy − h/2, M.y + 4, M.y + M.h − h − 4); x = R.x + R.w + 4 if P's centre is in M's left half, else R.x − w − 4.
+- No nearest-edge rule. `place()` runs on every render with the rects read at show time; the item rect is read again after a ConfigureNotify while shown (§4.7.8).
+
+#### 4.7.11 Genmon `<tool>` unchanged (D-51)
+Many ACs (AC-22, 37, 38, 42, 43, 76, 79) observe the tooltip through `<tool>`. Dropping it would not stop genmon re-setting its default tooltip every poll, so it would gain nothing; it stays the full-detail view (`cat net.txt`). Known limitation: with a genmon period ≥ 0.6 s both the GTK tooltip and the popup can appear; keep 0.25 s.
 
 ---
 
@@ -597,6 +702,19 @@ This is a summary card for Dev and QA. The binding detail is in 4.0 to 4.2.
 | D-43 | AC-10 method: each tooltip read is compared with the sysfs rate over the 1 s ending at the daemon tick that wrote it (`net.txt` mtime, 50 ms sysfs samples, interpolated); 2 s windows, ≥ 8/10 for ↓ and ↑, plus 20 s means within ±10 % | BA (from dev2 analysis and QA rounds 1-3) | The v1.2 same-window comparison had a built-in 0.5 s lag against the 1 s average, so bursty uploads failed although the 20 s means agreed within 1-6 %. Verified: 3 live runs, 10/10 ↓ and ↑ each |
 | D-44 | AC-52 window is t0 + 44-50 s, derived from the F-11 rule (60 s average > 256 KiB/s crosses at t0 + 44.65 s for the 128 → 300 KiB/s fixture). The F-11 rule is unchanged | BA | The v1.2 window (60-67 s) contradicted the rule it tests. Verified: sandbox first appearance at t0 + 45.8 s |
 | D-45 | The user accepted every RECOMMENDED option in §5 (OQ-1 to OQ-13) | User | "go with recommended options" (2026-11-20) |
+| D-46 | DEF-06 root cause: GTK restarts the 500 ms hover timeout on every `set_tooltip_markup`, which genmon calls every poll. The user chose an own popup; the genmon period stays 0.25 s (OQ-1/F-24 unchanged) | User, architect | Reproduced on Xvfb with the live GTK build (§3.9) |
+| D-47 | Separate helper `panelgraph-popup` on ctypes libX11/Xext/Xinerama/Xi/Xrandr + pycairo; no GTK, no python3-xlib. The daemon stays single-file and X-free | Architect | GTK helper RSS 148 MB (65 MB with GL off) and never idle; ctypes helper 22 MB hidden / 34 MB shown, 0 wakeups hidden; python3-xlib not installed; X inside the daemon would tie the graph to the X connection (Xlib's IO-error exit) |
+| D-48 | Item lookup through `$PPID` → `net.host` → wrapper argv[3]; geometry read at show time | Architect | Two genmon items run on the panel, so a /proc scan is ambiguous; the item has moved since v1.3, so coordinates must never be hard-coded |
+| D-49 | Event-driven Enter/Leave on the socket window; NotifyInferior Leave ignored; Enter handled only in IDLE; 0.5 s show delay, immediate hide; hide on any button (XI2 raw, selected only while pending or shown); zero timers while idle; synthetic events dropped; pointer re-checked every 0.25 s while shown | Architect, tech lead (A4, SEC-04, SEC-10) | Zero cost while hidden; a missed Leave or a screen locker grab cannot leave the popup up |
+| D-50 | popup.json v1 contract (§4.7.5). The daemon is the single formatter (`human()`); rows mirror the strips; atomic writes, only on change, only while the helper is alive | Architect | One source for the numbers; no cost when nobody reads it |
+| D-51 | Genmon `<tool>` kept unchanged | Architect | ACs depend on it; dropping it gains nothing (§4.7.11) |
+| D-52 | Popup look: fixed dark colours #1C1C1E/#3A3A3C/#E6E6E6, glyph colours only from the four graph colours, never #FF2020. The net.png palette and no-AA rules apply to net.png only | Architect | Theme-independent and testable; like the cpugraph tooltip |
+| D-53 | Placement by panel orientation and the half of the monitor the panel is in, clamped into the Xinerama/RandR monitor with 4 px margins; the popup is input-transparent | Architect | The nearest-edge rule picked the wrong side for a corner item in the prototype |
+| D-54 | Helper identity and lifecycle: comm `panelgraph-pop`, `popup.lock`/`popup.pid`, pidfd + PDEATHSIG + daemon `killpg`; exit codes 0/1/2/3 and the daemon's backoff 5/30/5/300 s (Popen failure 300 s); spawn only from the slow scan; `PANELGRAPH_POPUP_CMD` test-only and absolute | Architect, tech lead (A5, A6, SEC-09) | Single instance, never orphaned, ≤ 1 spawn per 5 s |
+| D-55 | Private runtime dir (F-26): `XDG_RUNTIME_DIR` must be absolute; no `/tmp` fallback; `secure_dir()` byte-identical in daemon and helper; the wrapper refuses first. Both the wrapper (on every call) and the daemon refuse a symlinked runtime dir or one owned by another uid; a dir that does not exist yet is allowed, so the daemon can create it | Tech lead (CR-2, SEC-01, SEC-08) | DEF-07; prerequisite for F-25, which adds `net.host` and `popup.*` to the same dir |
+| D-56 | `clean(s, n)`: UTF-8 with replace, drop categories Cc/Cf/Cs/Co/Cn/Zl/Zp, cut to n with "…" (no ellipsis for the SSID's 32). Used by `decode_ssid` and every popup label/row; `esc()` unchanged | Tech lead (SEC-06) | Bidi overrides, U+2028 and zero-width characters survived the Cc-only filter; a surrogate-escaped interface name would break the strict UTF-8 popup.json write |
+| D-57 | `IwRunner.poll` drains stdout to EOF after the child has exited, before parsing. Empty output stays "no data" (dev-instructions §5.5); it is not treated as a failure | Tech lead (CR-1, SEC-07) | iw could write and exit between the first drain and `poll()`, turning a lost `Connected to` into "not connected" and skipping the M2 BSSID roam guard |
+| D-58 | Helper wakeups: while hidden only Enter/Leave is selected on the item, and its loss is seen through a pidfd on the genmon wrapper; StructureNotify is selected only while SHOWN (from the start of the show attempt); DETACHED deselects the socket, which the panel keeps for a respawn. Shown, the rects are read once per show (the item rect again after a ConfigureNotify, at the next refresh), so a redraw costs one X round trip (the pointer check) | Developer (live cost finding, 2026-11-27); approved by tech lead (round 2) | Live, the shown popup made about 31-42 wakeups/s (0.4-0.57 % CPU): every 4 Hz redraw re-read the geometry with about 9 round trips. On Xvfb a neighbour item changing width at 4 Hz woke the hidden helper 4 times/s through StructureNotify (240 per 60 s against the budget of 2). After: hidden 0 per 60 s with and without relayouts; shown 8/s (0.42 %), shown while the item moves 20/s (0.53 %). Detached with a kept socket under the storm: 10 per 20 s (90 without the deselect). Wrapper lifetime checked in the xfce4-panel 4.20.8 source, §4.7.8. The live measurements were taken with the owner's approval |
 
 ---
 
@@ -614,11 +732,12 @@ This is a summary card for Dev and QA. The binding detail is in 4.0 to 4.2.
 | R9 security view | F-07, F-08, F-09, F-11, F-12, F-17-F-19, F-22 | AC-42, AC-44, AC-45, AC-47 to AC-54, AC-59 to AC-61, AC-64, AC-70, AC-74, AC-75 |
 | UD-a monitor colour, never summed | F-01, F-04, 4.6 | AC-23, AC-24, AC-27 to AC-33, AC-67, AC-68, AC-69, AC-76, AC-77, AC-78, AC-79 (coverage map in acceptance-criteria) |
 | UD-b security QA consultation | F-02, section 8 (SEC-QA-0 to SEC-QA-6), qa-instructions §7, §8, §11 | AC-22, AC-67 to AC-69, AC-77 to AC-79 |
+| R11 own hover popup | F-25, F-26, §4.7, DEF-06, DEF-07, D-46 to D-58 | AC-80 to AC-99 (AC-93 live, APPROVAL) |
 | UD-c documentation | these files | (review) |
-| NFR-1 never freeze | 3.6, F-05 (async iw), F-06 (escaping), F-10 | AC-01, AC-02, AC-03, AC-41, AC-42 |
+| NFR-1 never freeze | 3.6, F-05 (async iw), F-06 (escaping), F-10, F-25 (helper failures never touch net.txt) | AC-01, AC-02, AC-03, AC-41, AC-42, AC-82, AC-91 |
 | NFR-2 auto-recover | 3.6 | AC-04, AC-05 |
-| NFR-3 no respawn storm | 3.6 | AC-05, AC-06 |
-| NFR-4 cheap | F-01 cost, D-19 | AC-02, AC-07, AC-21, AC-40 |
+| NFR-3 no respawn storm | 3.6, F-26 | AC-05, AC-06, AC-94 |
+| NFR-4 cheap | F-01 cost, D-19, D-49, D-54, D-58 | AC-02, AC-07, AC-21, AC-40, AC-80, AC-83, AC-90 |
 | NFR-5 numbers match /sys | 3.1-3.2, F-01 | AC-10, AC-16, AC-23 |
 | NFR-6 Wi-Fi switch / hot-plug / suspend | F-01, F-16, F-20 | AC-17, AC-18, AC-25, AC-26, AC-58, AC-62, AC-72, AC-73 |
 | NFR-7 errors visible | 3.6, F-10 | AC-08, AC-41 |
@@ -642,9 +761,44 @@ This is a summary card for Dev and QA. The binding detail is in 4.0 to 4.2.
 
 The security specialist does not run sudo commands and does not change interface state. The user runs them, or explicitly authorises QA per step.
 
+### 8.1 Open items and follow-ups (v1.4)
+
+Found in the v1.4 code and security review and deliberately not fixed in the F-25 change, because they are unrelated to it or would touch the per-tick sampler that F-25 must leave pixel-identical (AC-92).
+
+| Id | Item | Reason deferred | Follow-up |
+|---|---|---|---|
+| CR-3 | A candidate that temporarily loses its `device`/`phy80211` link keeps `prev`, so one delta covers the whole gap and inflates the scale for 32 s and `Up 5 min` (deviation from D-15/F-01 rebaseline on class change) | Needs CAP_NET_ADMIN to trigger; touches the per-tick sampler | v1.0.1: `c.prev = c.kind = None` in the non-candidate branch, plus a link-flap sandbox AC |
+| CR-4 | F-11 sums 60 + 60 + 300 buckets every second instead of true running sums ("O(1)") | About 10 µs/s; no user impact | True running sums, then re-run AC-52 |
+| CR-5 | `any()` over the cache and `link_target()` run every tick although `IwRunner.poll` needs them on about 2 of 40 ticks | A few µs per tick | Pass a callable or compute lazily in `poll` |
+| CR-6 | `scan_attrs` reads `operstate` for ARPHRD_PPP although nothing uses it (F-17 unbuilt) | Harmless read every 5 s, PPP only | Decide with F-17: build it or drop PPP from that condition |
+| CR-7 | `_drain` stops at 64 KiB; iw would block only beyond 128 KiB of output | Unreachable (`iw dev` ≈ 300 B per interface) | Keep reading past the cap, discard, fail with reason `too large` |
+| SEC-13 | M2 re-baselines silently on a `carrier_changes` or BSSID change (§4.4 known limitations, D-23); a re-check 10-15 s after such a re-baseline would catch poisoning raced in right after a reconnect | New detection logic, not part of F-25 | Design a post-reconnect re-check. F-25 already guarantees the `!!` row is never dropped from the popup (AC-81) |
+| SEC-06 (tooltip) | Interface names reach the `<tool>` text only through `esc()`, which SEC-06 keeps unchanged. Its UTF-8 `replace` keeps net.txt valid (AC-97 holds), but U+2028/U+202E in an ifname survive, and U+2028 could forge an extra tooltip line | Needs CAP_NET_ADMIN, which can rewrite the gateway/ARP table directly; the tooltip cannot be seen at 0.25 s (DEF-06); `tooltip()` and `esc()` stay unchanged in F-25 | v1.0.1: `esc()` also drops BAD_CATS (filter only, no truncation); extend AC-95 with an ifname containing U+2028 + `!! Gateway MAC changed` and U+202E; re-run AC-42/AC-43 |
+| LIVE-CLICK-1 | On the real panel a click hides the popup, but it is mapped again about `SHOW_DELAY` later while the pointer stays on the item (AC-88 wants it hidden until a real leave). Likely cause, unverified: the panel's GTK pointer grab on press produces LeaveNotify mode `NotifyGrab` (→ IDLE) and, on release, EnterNotify mode `NotifyUngrab` (→ PENDING) | Not critical (owner decision, 2026-11-27); the click itself still opens xfce4-taskmanager. The virtual-X stand-in takes no grab, so the AC-88 self-test passes | Grab and ungrab crossings must not end SUPPRESSED or start a new show delay; only a real leave (`NotifyNormal`, detail ≠ `NotifyInferior`) does. Keep SEC-04/AC-92. Add a stand-in that grabs the pointer on press, as GTK does, to the virtual-X test |
+| PERM-0664 | `seen` and `net.host` (written by `panelgraph-show` under genmon's umask 002), and `lock`/`gw.json` created by v1.0.0, are 0664 inside the 0700 runtime dir | No exposure: the 0700 dir blocks other users | Create them 0600: `umask 077` in `panelgraph-show` (a builtin, check AC-02 and the hot-path cost), and let the daemon tighten files left by older versions |
+| REG-EMU-1 | The full emulator regression of F-25 (AC-01…AC-99 in one run) was stopped before its report, by the owner's decision to stop spending time on the test harness. Earlier rounds cover it: QA round 3 passed every functional, cost and regression check, and the live regression passed except LIVE-CLICK-1 | Harness problems, not product findings | Re-run the full regression with a fixed harness before the next feature release; check the one AC-32 strip-count flip it logged |
+
 ---
 
 ## 9. Change log
+
+### v1.4 (2026-11-27): own hover popup, private runtime dir, review fixes
+Trigger: the user reported that the graph's tooltip never appears on the Kali panel and decided to build an own hover popup instead of changing the genmon period. The architect confirmed the root cause (DEF-06) and designed F-25; the tech lead's review added the fix-now items (CR-1, CR-2/SEC-01/SEC-08, CR-8, SEC-02 to SEC-06, SEC-09 to SEC-11, SEC-14) and deferred the rest (§8.1).
+
+| # | Change | Where applied |
+|---|---|---|
+| 1 | R11; DEF-06 (genmon tooltip never shown below ~0.5 s); F-25 hover popup with design §4.7; D-46 to D-54 | req §2, §3.9, §4.3, §4.7, §6, §7 |
+| 2 | DEF-07; F-26 private runtime dir; D-55. `XDG_RUNTIME_DIR` is now required and absolute | req §3.9, §4.0, §4.3, §4.7.1; wrapper; daemon; helper |
+| 3 | `clean()` replaces the Cc-only filter for SSIDs and sanitises every popup label (D-56) | req §4.2; dev §5.5 |
+| 4 | iw runner drains to EOF after the child exits (D-57) | daemon `IwRunner.poll`; dev §5.5 |
+| 5 | Env hooks `PANELGRAPH_POPUP`, `_POPUP_CMD` (test only), `_POPUP_XID`, `_POPUP_MONITORS`, `_DAEMON_PID` | req §4.0; dev §4.1; README |
+| 6 | ACs AC-80 to AC-99 (AC-93 APPROVAL); AC-42 extended by AC-95; AC-92 static gate | AC file; qa §12 |
+| 7 | §1 no longer states the item's screen coordinates: the item has moved since v1.3 and is resolved at run time | req §1; qa §1, §3 |
+| 8 | Follow-ups CR-3 to CR-7 and SEC-13 recorded | req §8.1 |
+| 9 | Live cost finding: hidden helper selects only Enter/Leave and watches the wrapper's pidfd; geometry read once per show (D-58); AC-90 bounds extended, AC-86/AC-91 amended | req §4.7.7, §4.7.8, §4.7.10, §6; helper; AC-86, AC-90, AC-91; qa §12 |
+| 10 | Review round 2: a show selects StructureNotify before reading the rects; going DETACHED deselects the socket the panel keeps for a respawn; wrapper lifetime and the hung-wrapper limit from the xfce4-panel 4.20.8 source (D-58 approved); `PANELGRAPH_POPUP_XID` marked test only; AC-90 storm and no-storm bounds stated separately | req §4.0, §4.7.7, §4.7.8, §6; helper; AC-90, AC-91; dev §5.11; qa §12 |
+
+Measured on the developer's sandbox (Xvfb, Python 3.14): helper hidden 0.00 % CPU, 0 voluntary context switches in 60 s (also while a neighbour item relayouts at 4 Hz), VmRSS 21 MB; helper shown with 4 Hz content 0.42 % CPU, 8 context switches/s, VmRSS 32-34 MB; daemon with the helper 1.1-1.4 % CPU, VmRSS 27 MB (POPUP=0: 1.27 %, 26.5 MB); wrapper +31 µs per call.
 
 ### v1.3 (2026-11-20): user decisions and AC-10 / AC-52 fixes
 Trigger: user message "go with recommended options, fix AC-10 and AC-52".

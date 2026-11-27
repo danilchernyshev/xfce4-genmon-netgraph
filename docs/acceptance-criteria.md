@@ -1,6 +1,6 @@
 # panelgraph NETWORK graph: acceptance criteria
 
-Version 1.3, 2026-11-20. v1.3: AC-10 tick-matched method (D-43), AC-52 window t0+44-50 s (D-44), user decisions D-45 (all RECOMMENDED options). Author: BA. **v1.2 documents the security specialist's monitor-mode QA consultation** (`qa-instructions.md` §11, `requirements.md` D-39 to D-42):
+Version 1.4, 2026-11-27. **v1.4 adds the hover popup (F-25) and the private runtime dir (F-26)**: 20 new ACs, AC-80 to AC-99, in the section "NEW-MUST (v1.4)"; AC-93 is live and under APPROVAL. AC-42 is extended by AC-95. The file now defines AC-01 to AC-99 (99 ACs). Version 1.3, 2026-11-20. v1.3: AC-10 tick-matched method (D-43), AC-52 window t0+44-50 s (D-44), user decisions D-45 (all RECOMMENDED options). Author: BA. **v1.2 documents the security specialist's monitor-mode QA consultation** (`qa-instructions.md` §11, `requirements.md` D-39 to D-42):
 - AC-22, AC-67, AC-68 and AC-75 changed.
 - AC-77, AC-78 and AC-79 added.
 - New "Monitor-mode colour decision: coverage map".
@@ -8,7 +8,7 @@ Version 1.3, 2026-11-20. v1.3: AC-10 tick-matched method (D-43), AC-52 window t0
 v1.1 applied the specialists' sign-off corrections (`requirements.md` §9): AC-24, AC-25, AC-30, AC-32, AC-34, AC-38, AC-42, AC-43, AC-44, AC-48, AC-67, AC-68 changed; AC-76 added.
 
 How this file fits with the others:
-- Requirements and designs: `requirements.md`. Ids cited: R3-R9, UD-a/b, NFR-1…7, F-xx, D-xx.
+- Requirements and designs: `requirements.md`. Ids cited: R3-R11, UD-a/b, NFR-1…7, F-xx, D-xx.
 - Procedures, the sandbox harness, fixture values, scenario scripts S-A…S-U and the live steps L0-L3: `qa-instructions.md`. The monitor-mode consultation is §11 there.
 
 ## Tags
@@ -367,6 +367,7 @@ The user decided that monitor-mode traffic is shown in a **different colour** an
   - The plain tooltip contains `a&b<c>"d</tool>` (literal) and no BEL or newline inside the SSID.
   - The SSID shown is ≤ 32 characters.
   - `$QA/pwned` never exists.
+- Extended in v1.4 (AC-95): the fixture SSID also carries U+2028, `!! Gateway MAC changed`, U+202E and U+200B (as `\xe2\x80\xa8`, `\xe2\x80\xae`, `\xe2\x80\x8b`). The tooltip line count is unchanged, no line starts with `!!`, and none of those three code points appears anywhere in `net.txt`.
 
 **AC-43: Tooltip template** (R6-R9, F-06). Sandbox, worst case = S-H1 + M2 alert + promisc wlan0 (exists, down) + forwarding (eth0 and wlan1 up) + tun0 VPN (if Shoulds are built).
 - ≤ 10 lines. (With wlan0 kept beside wlan0mon in H1, this case reaches exactly 10 lines when all Shoulds are built: `!!`, Total, 3 strips, Gateway, `PROMISC wlan0`, VPN/upload, Forwarding, `Idle: wlan0 not connected`.)
@@ -462,6 +463,129 @@ The user decided that monitor-mode traffic is shown in a **different colour** an
   - `wlan2mon` has a managed strip line and is **not** named in the MONITOR line.
   - `Total ↓` = 640 KiB/s ±5 % (512 + 128). In every 50 ms poll from the step on, `Total ↓` ≤ 1.05 × 640 KiB/s.
   - The phy shown is `phy5`. Any other phy, or `?`, means the phy name is not read through `SYSNET` (fails AC-22 too).
+
+---
+
+## NEW-MUST (v1.4, F-25 hover popup, F-26 private runtime dir)
+
+Design: `requirements.md` §4.7, D-46 to D-58. Procedures and the virtual-X harness: `qa-instructions.md` §12. Rules for every AC here:
+- X tests run only on a private virtual display (Xvfb `:99` or higher; Xephyr nested in it for multi-head). Every xdotool call asserts that `DISPLAY` is not `:0`.
+- The sandbox always sets `PANELGRAPH_ADDRS`. Processes are stopped only through Popen handles or pid files after comm and cwd checks.
+- "Helper" means a process with comm `panelgraph-pop` and cwd = the sandbox runtime dir (found by a /proc scan, never `pgrep -f`). "Mapped" means `xwininfo -name panelgraph-popup` reports `IsViewable`.
+- "Stub helper" (content-only ACs, no X): `PANELGRAPH_POPUP_CMD` = an absolute script that lives until `PANELGRAPH_DAEMON_PID` exits (e.g. waits on its pidfd); `DISPLAY` set to any value.
+
+**AC-80: Wrapper records its parent** (F-25, D-48, NFR-4). Sandbox.
+- After one `panelgraph-show net` call from parent P, `net.host` holds P's pid followed by a newline. A `panelgraph-show mem` call does not create or change it.
+- AC-02 still holds: stdout byte-identical to `net.txt`, rc 0, no stderr, `PATH=/nonexistent`.
+- Cost: the per-call time of the new wrapper minus the v1.3 wrapper (dash, ≥ 3 × 4000 sourced calls, minimum of each) ≤ 50 µs. AC-01 to AC-06 are re-run.
+
+**AC-81: popup.json content** (F-25, D-50). Sandbox, stub helper, polls every 50 ms.
+- Every poll parses as compact UTF-8 JSON with `v` = 1.
+- Rows mirror the strips in order and count; each value is within ±5 % of the fixture and equals the tooltip's strip value of the same tick.
+- S-A: one table row `wlan1 ★`, `↓ ` FF4F00 512 KiB/s, `↑ ` FFE500 128 KiB/s.
+- S-D: a second, free row `wlan1mon (monitor)` with `↓ captured` ±5 % (FF00FF) and no `injected` cell while the monitor tx is 0; with the S-F/AC-29 fixture the `↑ injected` cell (FFA0FF) is present.
+- S-T: span row `monitor ended HH:MM:SS` within T1; overflow strip label `other: …`; no NIC at all: span row `No network interfaces`.
+- M2 (S-J1): a bold first row equal to the tooltip's `!!` line, within TM2. It is present whenever `gw.line` is set, also with 3 strips (SEC-13).
+- Colours only from {null, FF4F00, FFE500, FF00FF, FFA0FF}. No SSID or IP appears in popup.json.
+
+**AC-82: popup.json write policy** (F-25, D-50, D-30). Sandbox, stub helper.
+- With constant content (all rates 0, steady), popup.json's mtime is unchanged over 5 s.
+- It is never created with `PANELGRAPH_POPUP=0`, without `DISPLAY`, or with a relative `PANELGRAPH_POPUP_CMD` (which logs `not an absolute path` once).
+- `mkdir popup.json.tmp`: no "!" marker, `net.txt` keeps updating, one `net aux [popup]` error.log entry per 10 min.
+
+**AC-83: Helper lifecycle** (F-25, D-54, NFR-2/3/4). Virtual X, real chain (fake wrapper → panelgraph-show → daemon → helper). *Timing amended by the tech lead (A5).*
+- Exactly one helper (comm `panelgraph-pop`, cwd = runtime dir, `popup.pid` = its pid) ≤ 5.5 s after `net.host` first appears. None without `DISPLAY`, with `PANELGRAPH_POPUP=0`, or before `net.host` exists.
+- A second instance exits with rc 2 within 1 s.
+- `kill -9` of the helper: respawn between 30 s and 41 s later; never more than one spawn per 30 s (count spawns with a logging `PANELGRAPH_POPUP_CMD` wrapper that `exec`s the helper).
+- `PANELGRAPH_POPUP_CMD` = a stub that exits 1 (a crash, Q1): each respawn comes 30 s to 41 s after the previous exit, never sooner; `helper exited rc=1` is in error.log.
+- Dead display (`DISPLAY=:<unused>`): rc 3 is logged; at most one spawn per 300 s.
+- Daemon SIGTERM, `kill -9` and idle exit (AC-07): the helper is gone within 1 s and `popup.pid` is removed; a /proc scan finds no helper for that dir.
+- The daemon count by comm `panelgraph` is unchanged (AC-04/05/06).
+
+**AC-84: Show and hide** (F-25, D-49). Virtual X, fake panel.
+- Pointer moved onto the item: not mapped at +0.35 s, mapped by +0.9 s.
+- Moving inside the item, over its plug and button child windows: 0 unmapped samples (≥ 50 samples).
+- Unmapped ≤ 0.2 s after the pointer leaves; shown again after re-entering.
+- Never mapped while the pointer is outside the item (10 s sweep over the screen).
+
+**AC-85: Live update** (F-25). Virtual X. While shown, adding a strip (e.g. a monitor vif) makes the popup one line taller, and changed rates redraw it, within 0.75 s of the popup.json change.
+
+**AC-86: Placement** (F-25, D-53). Virtual X.
+- Top panel: popup top = item bottom + 4, horizontally centred on the item, clamped with a 4 px margin.
+- Bottom panel: popup bottom = item top − 4.
+- Vertical left panel: popup x = item right + 4; a right panel is symmetric (popup right = item left − 4).
+- Xephyr with two 1280x800 heads (`+xinerama`), item at the right end of head 0: the popup lies inside head 0.
+- `PANELGRAPH_POPUP_MONITORS` is honoured. The popup never overlaps the item.
+- The item moves while hidden (a neighbour changes width): the next show is centred on its new place (±1 px). The item moves while shown: re-placed (±1 px) within 0.6 s (D-58).
+
+**AC-87: Rediscovery** (F-25, D-48). Virtual X.
+- The fake panel and wrapper are killed and restarted with the item at a new x, the pointer resting where the item appears: the popup is mapped at the new place within 2.5 s of the new wrapper's first poll (net.host = its pid). The helper pid is unchanged.
+- With a second fake wrapper (another plugin id) running another command, `net.host` keeps the net wrapper's pid and the popup attaches to the net item.
+
+**AC-88: No focus or click impact** (F-25, D-53, SEC-04). Virtual X.
+- `xwininfo` shows Override Redirect State `yes`; `_NET_WM_WINDOW_TYPE_TOOLTIP` and `WM_CLASS "panelgraph-popup", "Panelgraph-popup"` are set.
+- The popup's input shape has 0 rectangles, and a point inside the popup is not hit by `XTranslateCoordinates` on root (the window below receives the click).
+- A click on the item logs exactly one click; the popup is unmapped within 0.3 s and stays hidden while the pointer stays inside; it comes back after leave and re-enter.
+- `xdotool getwindowfocus` is the same before and after the popup shows.
+- A test client sends a synthetic `EnterNotify` (`XSendEvent`) to the item while the pointer is outside: the popup is never mapped.
+
+**AC-89: Look** (F-25, D-52). Virtual X screenshot of the shown popup.
+- Background pixel exactly 1C1C1E, border pixel 3A3A3C, the corner pixel is not 1C1C1E (rounded by the shape).
+- No FF2020 pixel. Glyph hues only from the four graph colours (grey anti-aliasing only).
+
+**AC-90: Cost** (F-25, NFR-4, D-58).
+- Helper attached and hidden, 60 s: ≤ 0.05 % CPU and ≤ 2 voluntary context switches. This holds with a still panel and also while a neighbour item changes width every 0.25 s, so the panel moves the item's socket 4 times/s (the fake panel's relayout storm, §12).
+- Helper shown, content changing at 4 Hz, no relayout storm, 60 s: ≤ 1.0 % CPU and ≤ 12 voluntary context switches per second.
+- Helper shown, content changing at 4 Hz, with the relayout storm, 60 s: ≤ 1.0 % CPU. No context-switch bound here: each item move is one ConfigureNotify.
+- Helper VmRSS ≤ 40 MB, hidden and shown.
+- The daemon with the helper running still meets AC-21 (≤ 2 % CPU, ≤ 40 MB).
+
+**AC-91: Robustness** (F-25, NFR-1).
+- While shown, popup.json replaced by garbage, by a file > 16 KiB or by `"v":2`: no crash (helper pid unchanged), the last good content stays mapped, never an empty window.
+- Xvfb killed: the helper exits (rc 3 logged by the daemon) within 1 s; the daemon keeps writing `net.txt` with no "!".
+- The item's wrapper exits, while hidden or shown (xfce4-panel keeps the socket and a respawned wrapper reuses its id): the helper deselects the socket, stays, goes DETACHED at once and retries every 2 s (D-58).
+- Kept socket (the fake panel keeps it, as xfce4-panel does): the wrapper exits while SHOWN and `net.host` still names the dead pid. A 4 Hz relayout storm for 20 s while DETACHED: the helper makes ≤ 12 voluntary context switches in those 20 s (the 2 s retries only). Then a new wrapper with the same socket id writes `net.host`: the helper re-attaches within 2.5 s, shows on hover, and its pid is unchanged.
+
+**AC-92: Regression and static gate** (F-25, SEC-04). Sandbox + static.
+- Same deterministic fixture with `PANELGRAPH_POPUP=1` (stub helper) and `=0`: `net.png` bytes and the `<tool>` text are identical, and identical to the v1.3 daemon's. The `Graph`/mem code path is unchanged.
+- The daemon is still one file; AC-01 to AC-79 are re-run.
+- Static, comments stripped (docstrings count), on `bin/panelgraph-popup`: none of `XGrab`, `XUngrab`, `XSetInputFocus`, `XWarpPointer`, `XSendEvent`, `subprocess`, `os.system`, `os.exec`, `os.spawn`, `ButtonPressMask`, `ButtonReleaseMask`, `PointerMotionMask`, `KeyPressMask`, `KeyReleaseMask`, `SubstructureRedirectMask`, `ResizeRedirectMask`, `XI_RawKeyPress`, `XI_RawKeyRelease`, `XI_RawMotion`, `XI_KeyPress`, `XI_Motion`. `XSelectInput` only on the item xid; `XChangeProperty` and `XShapeCombine*` only on the helper's own window; `XISelectEvents` only on root and only with `XI_RawButtonPress`.
+- Static on `bin/panelgraph-daemon`: no `ctypes` or `gi` import; exactly two `subprocess.Popen` sites (iw, helper); AC-22 still passes for both files.
+
+**AC-94: Private runtime dir** (F-26, D-55, NFR-3). Sandbox + unit probe.
+- `XDG_RUNTIME_DIR` unset, `''` or `rel/x`: `panelgraph-show net` prints `<txt>!</txt><tool>panelgraph: XDG_RUNTIME_DIR is not set</tool>` with rc 0, starts no daemon, and creates nothing in its cwd or under `/tmp`. The daemon run directly exits 1 and creates nothing; the helper exits 3.
+- A pre-created `panelgraph` that is a symlink: daemon rc 1, helper rc 3, nothing written to the target.
+- `$d` (`$XDG_RUNTIME_DIR/panelgraph`) is a symlink to a dir we own: `panelgraph-show net` and `panelgraph-show mem` print `<txt>!</txt><tool>panelgraph: runtime dir is not private</tool>` with rc 0, nothing is written through the link (`seen`, `net.host`), and no daemon starts. A dangling symlink is refused the same way.
+- `$d` does not exist yet: the wrapper is not refused and starts the daemon (first start).
+- A `$d` owned by another uid cannot be reproduced without a second uid; it is covered by code review of the wrapper's `[ -O "$d" ]` test.
+- A pre-existing dir at 0775 is set to 0700 on daemon start.
+- AC-02 is still byte-identical with `PATH=/nonexistent`.
+- A dir owned by another uid: unit probe through `SourceFileLoader` with `os.getuid` patched → `secure_dir()` returns False.
+
+**AC-95: Hostile text** (D-56, SEC-06). Sandbox.
+- AC-42 extended (see AC-42).
+- An interface whose name contains byte 0xff (and U+202E) gives valid UTF-8 popup.json; its label contains `?` or U+FFFD, no surrogate and no U+202E.
+- Unit: `clean("y"*50, 40)` ends with `…` and has 40 code points; `decode_ssid` keeps exactly 32 without an ellipsis.
+
+**AC-96: iw drain race** (D-57, CR-1). Unit probe through `SourceFileLoader`.
+- `PANELGRAPH_IW` = a stub `sh -c 'printf …'`; start a link run; patch `runner.proc.poll` so its first call does `proc.wait()` and returns the code (an exit after the first drain).
+- `Not connected.` stub: `results[("link", "wlan1")]` has `data == {}` and `failed` False.
+- `Connected to aa:bb:cc:dd:ee:02` stub: `data["bssid"]` is present. (The v1.3 code loses it.)
+- AC-40, AC-41 and the M2 ACs are re-run.
+
+**AC-97: Markup invariant** (SEC-11). Sandbox, under the S-L hostile SSID fixture (AC-95 version) and the 0xff interface name: `net.txt` has exactly one `<click>` and its body is `xfce4-taskmanager`; `<txt>`/`<img>` contain no variable text; inside `<tool>` the only `<` are those of `<b>`, `</b>`, `<span foreground="#XXXXXX">` and `</span>`.
+
+**AC-98: Helper input validation** (SEC-02, SEC-05). Virtual X + unit.
+- `net.host` naming a non-genmon process of ours: the helper stays DETACHED (logs `panel item not found`), stays alive.
+- `net.host` or `popup.json` as a symlink: not followed (no crash; the symlinked popup.json content is never shown).
+- popup.json > 16 KiB: ignored, helper pid unchanged.
+- `PANELGRAPH_DAEMON_PID` `abc`, `0`, `''`, `-5`, `1 2` or unset → rc 3; a dead pid or a pid that is not the parent → rc 0.
+- `PANELGRAPH_POPUP_XID` invalid (`0xZZ`, out of range) and `PANELGRAPH_POPUP_MONITORS` malformed → ignored, no crash. Each malformed hook produces its own line in popup.log (`[env:xid]` and `[env:monitors]`), also when both are invalid in the same run.
+- An unreachable display (`DISPLAY=:97`) → rc 3 and one `[x] cannot open display` line in popup.log; the daemon still records `helper exited rc=3` in error.log.
+- popup.log is an append log (D-54): with an invalid `PANELGRAPH_POPUP_MONITORS` and no resolvable item, the `[env:monitors]` line is still present after `[attach] panel item not found`. A log storm over 30 distinct keys (unit, `log_once` with 4096-code-point messages) keeps the file ≤ 16384 B. A popup.log that is a symlink is not followed (the target is unchanged) and a FIFO does not block.
+- Unit, `os.getuid` patched: `resolve_host(pid)` of another uid → None. `parse_xid`, `parse_monitors`, `parse_dpi` and `parse_doc` reject the malformed inputs listed in `requirements.md` §4.7.7 and §4.7.9.
+
+**AC-99: A grab or screen locker hides the popup** (SEC-10). Virtual X. While the popup is shown, a test client maps a fullscreen override-redirect "locker" window and takes `XGrabPointer`: the popup is unmapped within 0.3 s and still unmapped 5 s later while the grab holds.
 
 ---
 
@@ -598,3 +722,17 @@ The procedures are in qa-instructions §8 (security specialist guidance).
 **AC-75: Live injection test** (R8). DEFERRED, APPROVAL (OQ-12).
 - `sudo aireplay-ng --test wlan0mon` (never `-0`/deauth) during L1 gives FFA0FF columns and an FFA0FF right bar in the monitor strip, and `Total ↑` is unchanged (±10 % of the wlan1 sysfs tx rate).
 - phy0 only; never inject on phy1 (the uplink card). Injection exposes wlan0's permanent MAC aa:bb:cc:dd:ee:03. The user must accept this when deciding OQ-12.
+
+**AC-93: Live hover popup** (R11, F-25). NEW-MUST (v1.4), APPROVAL (the user installs, restarts the daemon and hovers; agents never move the `:0` pointer).
+- The user runs `./install.sh`, restarts the daemon through its pid file (README "Stopping the daemon"), then hovers over the network graph and confirms:
+  - the popup appears about 0.5 s after the pointer rests on the item, just below it (or above/beside it for a bottom or vertical panel), inside the screen;
+  - it lists the strip interfaces with plausible rates that change while it is shown;
+  - a click still opens xfce4-taskmanager and hides the popup;
+  - it disappears when the pointer leaves.
+- QA read-only checks (no pointer action):
+  - one `panelgraph-pop` runs with cwd `$XDG_RUNTIME_DIR/panelgraph`;
+  - `net.host` holds the pid of the net item's genmon wrapper (argv[1] ends in `libgenmon.so`, its command is `panelgraph-show net`);
+  - the window named `panelgraph-popup` exists, unmapped, override-redirect;
+  - the runtime dir is mode 0700;
+  - helper idle CPU and RSS meet AC-90.
+- F-25 is "done" only after the user confirms; until then it is "ready for live acceptance".

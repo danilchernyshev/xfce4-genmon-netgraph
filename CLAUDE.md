@@ -5,20 +5,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 **xfce4-genmon-netgraph** (internal name **panelgraph**): a cpugraph-style network (and RAM) graph for the XFCE panel, shown through
-`xfce4-genmon-plugin`. There are two executables in `bin/` and no build step, package
-manager or test suite in the repo. Runtime deps: `python3-cairo`, `xfce4-genmon-plugin`, `iw`.
+`xfce4-genmon-plugin`. There are three executables in `bin/` and no build step, package
+manager or test suite in the repo. Runtime deps: `python3-cairo`, `xfce4-genmon-plugin`, `iw`,
+and for the hover popup the X client libraries `libX11`, `libXext` (required) and `libXi`,
+`libXinerama`, `libXrandr` (optional), loaded through `ctypes` by soname, no extra packages.
 
-**Work in progress:** the v1.0.0 release is being prepared. Before doing anything else in a new
+**Release state:** v1.0.0 is released (tag `v1.0.0`). Before doing anything else in a new
 session, read `docs/RELEASE-CHECKLIST.md`, continue from its first unticked box, and tick the
 boxes as you go.
 
 The repo is public. Before every commit, check that no real SSIDs, MACs, IPs, usernames or
 emails go in. The docs use the placeholders `HomeNet`, `aa:bb:cc:dd:ee:0N` and `192.168.1.x`.
 
+**Git:** do feature work on a local branch; `main` mirrors the released state. Local commits are
+fine; **never push, tag-push or publish a release without the owner's explicit instruction in the
+current chat** (a local `pre-push` hook enforces this; never bypass it). Commit messages in
+English; author identity is the GitHub noreply address.
+
 ```bash
 ./install.sh                              # copies bin/* to ~/.local/bin (copies, not symlinks: re-run after every edit)
-python3 -m py_compile bin/panelgraph-daemon   # quick syntax check
+python3 -X dev -W error -m py_compile bin/panelgraph-daemon bin/panelgraph-popup   # syntax check
+dash -n bin/panelgraph-show                   # the wrapper must stay POSIX sh
 cat $XDG_RUNTIME_DIR/panelgraph/error.log     # last daemon error
+cat $XDG_RUNTIME_DIR/panelgraph/popup.log     # last hover-popup helper messages
 ```
 
 The genmon panel item runs `~/.local/bin/panelgraph-show net` (`mem` for RAM). `panelgraph-show`
@@ -27,11 +36,16 @@ effect after `install.sh` and a daemon restart (stop it via its pid file, see Sa
 
 ## Architecture
 
+- **Runtime dir** (F-26, D-55): `$XDG_RUNTIME_DIR/panelgraph`, only from an absolute
+  `XDG_RUNTIME_DIR` (there is no `/tmp` fallback). The daemon and the helper create it 0700 and
+  refuse to run when it is a symlink or not owned by the user; their resolver and `secure_dir()`
+  are byte-identical copies and must stay so.
 - **`bin/panelgraph-show`** (POSIX sh) is the genmon command. It runs about 8 times a second, so it
-  uses **shell builtins only** on the hot path. It prints `$XDG_RUNTIME_DIR/panelgraph/<name>.txt`,
-  touches `seen`, and starts the daemon with `setsid -f` when the pid file is stale. Stale means
-  `/proc/$pid/comm != panelgraph` or `/proc/$pid/cwd` is not the runtime dir, and it only starts
-  one while the `lock` flock is free.
+  uses **shell builtins only** on the hot path. It refuses a missing or relative
+  `XDG_RUNTIME_DIR`, prints `$XDG_RUNTIME_DIR/panelgraph/<name>.txt`, touches `seen`, writes
+  `$PPID` (the genmon wrapper) to `net.host` for the `net` item, and starts the daemon with
+  `setsid -f` when the pid file is stale. Stale means `/proc/$pid/comm != panelgraph` or
+  `/proc/$pid/cwd` is not the runtime dir, and it only starts one while the `lock` flock is free.
 - **`bin/panelgraph-daemon`** (one Python file, kept single-file so deploys stay atomic) is the
   core. `main()` closes inherited fds (genmon waits for EOF on every pipe), chdirs into the
   runtime dir, takes `flock` and sets `/proc/self/comm = panelgraph`. `run()` then ticks every
@@ -51,6 +65,20 @@ effect after `install.sh` and a daemon restart (stop it via its pid file, see Sa
   - The daemon exits when `seen` has not changed for `IDLE_EXIT` s (checked on the monotonic
     clock). After a fatal error it stays alive for `FATAL_HOLD` s while holding the lock, so
     genmon does not respawn it 8 times a second.
+  - `PopupHelper` starts `panelgraph-popup` (from the slow scan, with exit-code backoff
+    `POPUP_RETRY`) and, while it runs, writes `popup.json` atomically when its text changes.
+    `NetMonitor.popup_rows()` builds those rows from the same strips as the graph. The daemon
+    itself never imports ctypes or any X library.
+- **`bin/panelgraph-popup`** (F-25; one Python file, ctypes Xlib + pycairo, no GTK) is the hover
+  popup. It exists because genmon re-sets its tooltip on every poll, which restarts GTK's 500 ms
+  hover delay, so genmon's own `<tool>` never shows at a 0.25 s period (DEF-06). The helper finds
+  the panel item through `net.host` → the wrapper's argv socket XID, listens for Enter/Leave on
+  that window (event driven, no pointer polling while hidden), and maps an override-redirect,
+  input-transparent popup after `SHOW_DELAY`. It never grabs the pointer or keyboard, never
+  selects button/key events on foreign windows and ignores synthetic (`send_event`) events
+  (static gate AC-92). Its comm is `panelgraph-pop`; it holds `popup.lock`, writes `popup.pid`
+  and `popup.log`, and exits with the daemon (pidfd + `PR_SET_PDEATHSIG`). Exit codes: 0 done,
+  1 crash, 2 another instance, 3 feature unavailable (no display, libraries or usable visual).
 - **Image layout**: 140×32. Down/up bars come first, then 128 history columns, cut into up to
   `MAX_STRIPS` horizontal strips: one per managed card, an `other` sum strip, and the monitor
   strip last. An alert frame means the content box shrinks by 1 px. The exact geometry, colours
@@ -59,10 +87,14 @@ effect after `install.sh` and a daemon restart (stop it via its pid file, see Sa
 
 ## Specs are binding
 
-`docs/requirements.md` (spec v1.3, decision log D-xx, features F-xx),
-`docs/acceptance-criteria.md` (AC-01…AC-79) and `docs/dev-instructions.md` define the behaviour.
+`docs/requirements.md` (spec v1.4, decision log D-xx, features F-xx),
+`docs/acceptance-criteria.md` (AC-01…AC-99) and `docs/dev-instructions.md` define the behaviour.
 Before changing behaviour, read the relevant section. If code and spec conflict, ask rather than
 improvise. `docs/backup/` holds earlier versions of the docs and daemon. Don't edit it.
+
+**Code standard:** `docs/dev-instructions.md` §10 is binding for every code change (structure,
+constants, error handling, subprocess/cost rules, POSIX sh, ctypes, comments, commits and the
+static-analysis gate). Read it before writing code; reviewers reject changes that break it.
 
 Invariants that are easy to break:
 - **Cost (NFR-4):** no process spawn per tick, and never `nmcli`/`ip`/`ss`/`subprocess.run`. Every
@@ -75,6 +107,9 @@ Invariants that are easy to break:
   used only for the alert frame.
 - Hard-coded `/sys/class/net`, `/proc/net`, `/proc/sys/net` and `/sys/class/ieee80211` may appear
   only as defaults of the `PANELGRAPH_*` env constants (static gate AC-22).
+- SSIDs and every `popup.json` label go through `clean()` (D-56). Interface names in the genmon
+  tooltip are only `esc()`-escaped until the v1.0.1 `esc()` follow-up. Everything variable goes
+  through `esc()` before it enters genmon markup. Never put a variable into `<click>` or `<txt>`.
 
 ## Testing: sandbox only
 
@@ -86,10 +121,17 @@ are in `docs/qa-instructions.md` §5–§6 and §11. Its hard-coded scratch path
 `QA` at the current scratchpad. **Always set `PANELGRAPH_ADDRS`**: without it the daemon calls
 ioctl on the real interfaces and shows live IPs.
 
+The popup is tested on a private virtual display (Xvfb, or Xephyr nested in Xvfb for several
+monitors), never on `:0`: `PANELGRAPH_POPUP=0` disables the helper, `PANELGRAPH_POPUP_CMD`
+(test only, absolute path) replaces it, `PANELGRAPH_POPUP_XID` points it at a stand-in window
+instead of `net.host`, and `PANELGRAPH_POPUP_MONITORS` (`x,y,w,h;...`) overrides the monitor
+layout. Moving the virtual display's pointer with `xdotool` is fine; the real pointer is not.
+
 ## Safety (from the dev/QA docs; this is a pentest box)
 
 - **Never `pkill -f panelgraph` / `pgrep -f`**: the pattern matches your own shell. Stop a daemon
-  only via its pid file, after checking `/proc/$pid/comm == panelgraph` and its cwd.
+  only via its pid file, after checking `/proc/$pid/comm == panelgraph` and its cwd. The popup
+  helper exits by itself within milliseconds of its daemon; don't kill it separately.
 - Do not change interface state (no airmon-ng, `iw … set`, `ip link set`, nmcli, macchanger,
   firewall). Monitor mode, promisc and gateway changes are tested only in the sandbox. Live
   variants (`qa-instructions.md` §8) need the user's explicit approval, and the user runs the sudo.
