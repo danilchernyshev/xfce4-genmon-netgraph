@@ -1,5 +1,7 @@
 # panelgraph NETWORK graph v2: developer instructions
 
+Version 1.3, 2026-11-27. **v1.3 adds the hover popup (F-25) and the private runtime dir (F-26):** the helper file and the wrapper line (§1), helper constraints (§3), new hooks (§4.1), the SSID rule with `clean()` and the iw drain to EOF (§5.5), the design summary (§5.11), tasks T10 to T14 (§6; the former T10 "self-test and deploy" is now T15), deploy of three files (§8) and the DoD (§9).
+
 Version 1.2, 2026-11-20. Author: BA. **v1.2 adds the security specialist's QA consultation requirements:**
 - §4.1, the sandbox hooks as a **blocker** (DEF-05);
 - §5.10, the consolidated **monitor-mode colour task**;
@@ -14,7 +16,9 @@ Read `requirements.md` §4 (binding design) and `acceptance-criteria.md` (what Q
 | File | Action |
 |---|---|
 | `~/.local/bin/panelgraph-daemon` | **Main work.** Today 392 lines. Keep it a single file (atomic deploy). An optional helper module next to it (`~/.local/bin/panelgraph_net.py`) is allowed, but it makes deploys non-atomic. Recommended: no module. |
-| `~/.local/bin/panelgraph-show` | **No change needed.** If you touch it, it must stay builtins-only on the hot path, and AC-01 to AC-06 must be re-run. |
+| `~/.local/bin/panelgraph-show` | v1.3: two changes only, both builtins: the absolute-`XDG_RUNTIME_DIR` `case` (F-26) and the `net.host` line (F-25). It must stay builtins-only on the hot path, and AC-01 to AC-06 must be re-run. |
+| `~/.local/bin/panelgraph-popup` | v1.3, **new**: the hover popup helper (F-25). One file, stdlib + cairo, ctypes for X. Started only by the daemon. |
+| `install.sh` | Copies and `chmod +x`es all three files in `bin/`. |
 | `~/.local/share/panelgraph/backup/` | Backups (§7) |
 | Scratch: `$SCRATCH/wf3/dev/` | Your working copy and sandbox runs |
 
@@ -43,6 +47,13 @@ Do **not** touch:
   - No process spawn per tick; at most one `iw` spawn per 5 s (plus the rare M2 extra).
   - Never `nmcli`, `ip`, `ss` or `subprocess.run`.
   - Target ≤ 2.0 % of one core and RSS ≤ 40 MB (AC-21).
+- **Runtime dir (F-26, D-55):** the resolver lines and `secure_dir()` are byte-identical in the daemon and the helper and marked as such; QA diffs them. No `/tmp` fallback; `main()` calls `secure_dir()` before writing anything and returns 1 when it fails.
+- **Helper (F-25, D-54):**
+  - comm `panelgraph-pop`, **never** `panelgraph`: panelgraph-show and QA count daemons by that comm.
+  - It is started only from the daemon's slow scan (`PopupHelper.poll`), at most once per 5 s; the wrapper never starts it.
+  - It spawns nothing, imports nothing beyond the stdlib and cairo, and never grabs, warps, sets focus or sends events. No key, motion or button masks; `XSelectInput` only on the item's socket window; XI2 raw button events only on root and only while pending or shown.
+  - Every exit path removes `popup.pid` only if it holds the helper's pid. Exit codes 0/1/2/3 as in requirements §4.7.6.
+- **The daemon stays X-free:** no ctypes, gi or X library import, ever.
 - **Constants unchanged:** `INTERVAL 0.25`, `HISTORY 128`, `HEIGHT 32`, `BAR_W 4`, `BAR_GAP 2`, `NET_FLOOR 64 KiB`, `NET_SMOOTH 4`, `IDLE_EXIT 30`, `ERROR_RETRY 5`, `FATAL_HOLD 30`, `CLICK "xfce4-taskmanager"`, `human()` formatting.
 
 ## 4. Exact constants for v2
@@ -107,7 +118,12 @@ Requirements:
 | `PANELGRAPH_IW` | `shutil.which("iw")` or `/usr/sbin/iw` | every iw spawn |
 | `PANELGRAPH_ADDRS` | unset (use SIOCGIFADDR) | when set, **all** IPv4 lookups come from the file and the ioctl is never called. Otherwise a fake `wlan1` leaks the live IP. |
 | `PANELGRAPH_ALERT_HOLD` | `600` | M2 frame hold |
-| `XDG_RUNTIME_DIR` | already supported | output dir |
+| `XDG_RUNTIME_DIR` | **required, absolute** (v1.3, F-26) | output dir; no `/tmp` fallback |
+| `PANELGRAPH_POPUP` | `1` | `0` disables the hover popup helper |
+| `PANELGRAPH_POPUP_CMD` | `panelgraph-popup` next to the daemon | **test only**; must be absolute (else the popup is disabled and logged once); resolved at import |
+| `PANELGRAPH_POPUP_XID` | unset | helper target window (decimal or `0x` hex); skips `net.host` |
+| `PANELGRAPH_POPUP_MONITORS` | unset | helper monitor override `x,y,w,h;…` |
+| `PANELGRAPH_DAEMON_PID` | set by the daemon | helper's parent pid; missing/invalid → helper exit 3 |
 
 QA's static gate (AC-22):
 - `grep` finds all six names.
@@ -247,14 +263,24 @@ each tick:
   - Ignore the `multicast TXQ` table lines.
 - **`iw link` parser:** `Connected to ([0-9a-f:]{17})`, `SSID: (.*)`, `freq: ([\d.]+)`, `signal: (-?\d+) dBm`, `rx bitrate: ([\d.]+) MBit/s`, `tx bitrate: ([\d.]+) MBit/s`. `Not connected.` means no link data.
   - A parse failure is output that is neither empty nor matches any `Interface`/`Connected`/`Not connected` line.
+- **Drain to EOF after exit** (v1.3, D-57): once `proc.poll()` reports the exit, call `_drain()` again before parsing. iw may write and exit between the first drain and `poll()`; without the second drain a lost `Connected to …` reads as "not connected" and the M2 BSSID guard is skipped. The writer has exited, so this cannot block; the 64 KiB cap still bounds it. Empty output is still not a failure (rule above).
 - **SSID source** (D-35): the tooltip SSID comes from the `ssid` line of `iw dev`; if `iw dev` has none for that interface, from the `SSID:` line of `iw dev <if> link`. Both use iw's `\xNN` escaping and both are attacker-controlled.
-- **SSID decoding.** iw prints non-printables, edge spaces and `\` as `\xNN`. **Both parsers call the same function** (`decode_ssid`), and its result is escaped with `esc()` at interpolation time (§5.7): decode → strip Cc → truncate to 32 → escape.
+- **SSID decoding.** iw prints non-printables, edge spaces and `\` as `\xNN`. **Both parsers call the same function** (`decode_ssid`), and its result is escaped with `esc()` at interpolation time (§5.7): decode → strip Cc/Cf/Cs/Co/Cn/Zl/Zp with `clean()` (v1.3, D-56) → truncate to 32 → escape.
   ```python
+  BAD_CATS = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+
+  def clean(s, n, ell=True):
+      s = str(s).encode("utf-8", "replace").decode("utf-8")
+      s = "".join(ch for ch in s if unicodedata.category(ch) not in BAD_CATS)
+      if len(s) <= n:
+          return s
+      return s[:n - 1] + "…" if ell else s[:n]
+
   def decode_ssid(ssid):
       raw = re.sub(rb"\\x([0-9a-fA-F]{2})", lambda m: bytes([int(m[1], 16)]), ssid.encode("utf-8", "surrogateescape"))
-      s = raw.decode("utf-8", "replace")
-      return "".join(ch for ch in s if unicodedata.category(ch) != "Cc")[:32]
+      return clean(raw.decode("utf-8", "replace"), 32, ell=False)
   ```
+  `clean()` also sanitises every popup.json label (40) and span row (96). `esc()` is unchanged.
 - **Stale handling:**
   - If the latest attempt of a command failed and it has a previous success, show ` (stale Ns)` with N = now − ok_at.
   - Once N > 30, or with no previous success, show `Wi-Fi details unavailable (<reason>)` with reason ∈ {`iw missing`, `timeout`, `parse`}.
@@ -328,7 +354,8 @@ Build the tooltip from the template in `requirements.md` §4.2.
 ### 5.9 Error logging
 
 - `log_once(key, text)`: call the existing `log_error` at most once per key per 600 s. `error.log` still holds only the latest entry; that is accepted.
-- Keys: `iw:timeout`, `iw:missing`, `iw:parse`, `route`, `arp`, `wireless`, `ioctl`, `gwjson`, `scan`.
+- Keys: `iw:timeout`, `iw:missing`, `iw:parse`, `route`, `arp`, `wireless`, `ioctl`, `gwjson`, `scan`, `popup` (v1.3: popup.json write errors, helper exits other than 0/2, a relative `PANELGRAPH_POPUP_CMD`, spawn failures).
+- The helper has its own `log_once` that appends to `popup.log`, at most once per key per 600 s (`LOG_ONCE_PERIOD`). Each call opens it with `O_WRONLY|O_APPEND|O_CREAT|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK` and mode 0600, requires `S_ISREG` via fstat, and does one `os.write` of the whole entry; when `st_size` plus the entry would pass `POPUP_LOG_MAX` (16384 B) it restarts the file with `write_atomic`. An entry keeps its last `POPUP_LOG_ENTRY_MAX` (4096) code points, so a traceback keeps its last frames. `OSError` is swallowed (nowhere left to report). This is the one exception to "every write goes through `write_atomic`": appending keeps the root cause next to what followed it. Keys: `attach`, `doc`, `render`, `place`, `xi`, `env`, `x`, `lib:Xi`/`lib:Xinerama`/`lib:Xrandr`, `crash`.
 
 ### 5.10 Monitor-mode colour task (user decision a, D-04, D-07). Consolidated checklist.
 
@@ -358,6 +385,28 @@ The user decided that monitor-mode traffic is drawn in a **different colour** an
    - Names are escaped. (AC-27, AC-43, AC-76)
 8. **Promisc is never magenta** (D-09): tooltip line only. (AC-44)
 
+### 5.11 Hover popup (F-25) and private runtime dir (F-26). v1.3.
+
+The binding design is `requirements.md` §4.7 (with D-46 to D-58). This is the implementation map.
+
+**Wrapper (`bin/panelgraph-show`).** Replace the `${XDG_RUNTIME_DIR:-/tmp}` line by the `case` refusal (§4.7.1). Right after it, refuse a `$d` that is a symlink or exists and is not ours (`[ -h ]`, `[ -e ]`, `[ -O ]`, on every call); the daemon's `secure_dir()` refuses the same dirs, so both the wrapper and the daemon refuse a symlinked runtime dir or one owned by another uid (D-55). After the `seen` line add `[ "$1" = net ] && printf '%s\n' "$PPID" 2>/dev/null > "$d/net.host"`. Both are builtins; every added line carries a comment with the reason and spec id; `dash -n` must pass and AC-02 must stay byte-identical.
+
+**Daemon (`bin/panelgraph-daemon`), additions only:**
+- Constants: `BAD_CATS`, `POPUP_SCHEMA`, `POPUP_LABEL_MAX` 40, `POPUP_SPAN_MAX` 96, `POPUP_RETRY` {0: 5, 2: 5, 3: 300}, `POPUP_RETRY_ELSE` 30, `POPUP_RETRY_SPAWN` 300, `POPUP_QUIET_RC` (0, 2), `POPUP_ERROR_ROWS`; the D-55 block (`DIR_MODE`, `UMASK`, `_XDG`, `DIR`); runtime paths derived only when `DIR` is set (`POPUP_JSON`, `NET_HOST` among them); env hooks `POPUP`, `POPUP_CMD`, `POPUP_XID_SET`, `DISPLAY`.
+- Helpers: `clean()`, `secure_dir()`.
+- `NetMonitor.popup_rows(managed, mon_active)` (+ `_strip_label`, `_monitor_row`), called by `build()`; result in `self.popup`. `tooltip()` is unchanged.
+- `PopupHelper` (`alive`, `poll`, `feed`, `kill`). `run()`: `helper.poll(start)` in the existing slow block; `helper.feed(netmon.popup)` after `net.update()`; `helper.feed(POPUP_ERROR_ROWS)` best effort in the net failure branch; `helper.kill()` in `finally`. `main()`: `secure_dir()` right after `closerange`.
+- `IwRunner.poll`: `_drain()` again before `_finish()` (D-57).
+- Per-tick cost of the additions (measured): ≤ 65 µs worst case (`popup_rows` 6 µs, changed `feed` 58 µs, `alive` 1 µs).
+
+**Helper (`bin/panelgraph-popup`), one file in the daemon's layout order:**
+1. Constants (identity, exit codes, timing, input limits, look, states), env hooks read once, the D-55 block, Xlib constants named after X.h/XI2.h/shape.h, ctypes structures named after the Xlib types (`XEvent` union padded to 24 longs, partial `XImageHead`), and **one** declaration table `LIBS` bound by `proto()` with `restype`/`argtypes` for every function.
+2. Pure helpers, unit-testable without X (A9): `secure_dir`, `write_atomic`, `log_once`, `read_capped`, `parse_pid`, `parse_xid`, `read_host_pid`, `resolve_host`, `parse_monitors`, `parse_dpi`, `parse_doc`, `layout`, `draw`, `corner_insets`, `shape_spans`, `pick_monitor`, `place`.
+3. X side: `load_libs`, the module-level `CFUNCTYPE` error handlers, class `Popup` (window creation, item lookup, geometry, upload, state machine, event loop), `open_popup`, `serve`, `main`.
+- Importing the file has no side effects (no X connection, chdir, write or signal handler).
+- Wakeups (D-58): `ITEM_MASK_HIDDEN` (Enter|Leave) on the socket in IDLE, PENDING and SUPPRESSED; `ITEM_MASK_SHOWN` (+ StructureNotify) from the start of `show()`, before the rects are read so no move is missed, and back to the hidden mask on every hide or failed show; `NoEventMask` on `detach()`, because xfce4-panel keeps the socket for a respawned wrapper (`XSync` first, then the expected BadWindow is absorbed into `seen_errors`). All through the one `select_item()` call site. `find_item()` returns the wrapper's pidfd with the XID, and the loop selects on it. `geometry()` reads the panel rect and monitors once per show (`frame`); a ConfigureNotify while shown only clears `geo`, so the next refresh reads the item rect again.
+- Sonames are loaded directly (`libX11.so.6`, …): `ctypes.util.find_library` would run `ldconfig`, and the helper starts no processes. X11, Xext and libc are required: an `OSError` (or missing symbol) on any of them → exit 3. Xi, Xinerama and Xrandr are optional: a failure is logged once (`lib:<key>`) and degrades (no raw-button hide; the root as the only monitor), never an exit.
+
 ## 6. Ordered implementation tasks
 
 | # | Task | Satisfies ACs |
@@ -372,7 +421,12 @@ The user decided that monitor-mode traffic is drawn in a **different colour** an
 | T7 | Tooltip builder with escaping and glyphs (§5.7) | AC-37, AC-42, AC-43, AC-76 (MONITOR line) |
 | T8 | M2 alert, frame + inset rendering, gw.json, acceptance (§5.6) | AC-47, AC-48, AC-49, AC-50, AC-51 |
 | T9 | Shoulds F-11 to F-16 (§5.8). If time runs out, ship without them and tell QA which are built. | AC-52 to AC-58 |
-| T10 | Self-test all sandbox ACs. Deploy (§8). Run the live read-only checks AC-01 to AC-05, AC-10, AC-11, AC-19 to AC-21, AC-39, AC-45. Hand over to QA. | regression set |
+| T10 | **v1.3, first, its own commit.** Private runtime dir (F-26, §4.7.1): resolver + `secure_dir()` in the daemon (and later, byte-identical, in the helper); the wrapper's `case` refusal. Separate commits follow for the iw drain (D-57) and `clean()` + the docstring pointer (D-56, CR-8). | AC-94, AC-95, AC-96, AC-02 |
+| T11 | Wrapper `net.host` line (§5.11) | AC-80, AC-01 to AC-06 |
+| T12 | Daemon popup feed: `popup_rows`, `PopupHelper`, popup.json writes (§5.11) | AC-81, AC-82, AC-83, AC-92 (regression part) |
+| T13 | Helper `bin/panelgraph-popup` and `install.sh` (three files) (§5.11, requirements §4.7.6-§4.7.10) | AC-84 to AC-91, AC-97 to AC-99, AC-92 (static gate) |
+| T14 | Docs (requirements, AC, dev, qa §12, README) | review; AC-93 hand-off |
+| T15 | (was T10 in v1.2) Self-test all sandbox ACs. Deploy (§8). Run the live read-only checks AC-01 to AC-05, AC-10, AC-11, AC-19 to AC-21, AC-39, AC-45. Hand over to QA. | regression set |
 
 Could items (F-17 to F-21) and deferred items (F-22 to F-24): do not build unless the BA or user says so.
 
@@ -412,6 +466,7 @@ mv -f ~/.local/bin/.panelgraph-daemon.new ~/.local/bin/panelgraph-daemon
    P2=$(cat "$D/pid"); echo "old=$P new=$P2 comm=$(cat /proc/$P2/comm)"; head -c 300 "$D/net.txt"
    ```
    genmon's next `panelgraph-show` call (≤ 250 ms) starts the new daemon. Expected: new pid, comm `panelgraph`, `net.txt` starting with `<img>`.
+   - v1.3: install `panelgraph-popup` (and `panelgraph-show`) the same atomic way (`cp` to `.name.new`, `chmod 755`, `mv -f`) **before** restarting the daemon. Stopping the daemon also stops the helper (pidfd, PDEATHSIG and the daemon's `killpg`); the new daemon starts the new helper within one slow scan (≤ 5.5 s) once `net.host` exists. Never kill the helper by pattern; if needed, use `popup.pid` after checking comm `panelgraph-pop` and the cwd.
 4. If `net.txt` shows `<txt>!</txt>`: read `$D/error.log`, fix or roll back (§7), and restart again.
 5. Leave the daemon running.
 
@@ -430,3 +485,6 @@ mv -f ~/.local/bin/.panelgraph-daemon.new ~/.local/bin/panelgraph-daemon
   - any deviation from these documents (which needs BA sign-off);
   - the env vars and fixture assumptions QA needs.
 - [ ] No live interface-state test was performed. Those (AC-67 to AC-75) are for QA with the user's approval.
+- [ ] v1.3 (F-25/F-26): AC-80 to AC-92 and AC-94 to AC-99 pass in the self-test (virtual X only, never `:0`); AC-01 to AC-79 re-run; AC-93 handed to the user as an install + hover checklist.
+- [ ] v1.3: `python3 -X dev -W error -m py_compile` on both Python files, `dash -n bin/panelgraph-show`, `bash -n install.sh`; the AC-22 and AC-92 static gates pass; the D-55 block is byte-identical in daemon and helper.
+- [ ] v1.3: no `__pycache__`, scratch paths or prototype leftovers committed. Privacy grep over the diff and new files (SEC-14): no MAC other than `aa:bb:cc:dd:ee:0N` and `02:00:00:00:00:xx`, no IPv4 other than `192.168.1.x` and `10.99.0.x`, no `/home/<user>` other than `/home/kali`, no real SSID; no live `net.txt`, `popup.json` or `popup.log` content in the docs.
