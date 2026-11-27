@@ -92,6 +92,10 @@ effect after `install.sh` and a daemon restart (stop it via its pid file, see Sa
 Before changing behaviour, read the relevant section. If code and spec conflict, ask rather than
 improvise. `docs/backup/` holds earlier versions of the docs and daemon. Don't edit it.
 
+**Code standard:** `docs/dev-instructions.md` §10 is binding for every code change (structure,
+constants, error handling, subprocess/cost rules, POSIX sh, ctypes, comments, commits and the
+static-analysis gate). Read it before writing code; reviewers reject changes that break it.
+
 Invariants that are easy to break:
 - **Cost (NFR-4):** no process spawn per tick, and never `nmcli`/`ip`/`ss`/`subprocess.run`. Every
   subprocess uses `stdin/stderr=DEVNULL, close_fds=True, start_new_session=True`. Target ≤ 2 % of

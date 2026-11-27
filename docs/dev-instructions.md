@@ -1,5 +1,7 @@
 # panelgraph NETWORK graph v2: developer instructions
 
+Version 1.4, 2026-11-27. **v1.4 adds the code standard (§10)** that the tech lead set for F-25, generalised for later changes.
+
 Version 1.3, 2026-11-27. **v1.3 adds the hover popup (F-25) and the private runtime dir (F-26):** the helper file and the wrapper line (§1), helper constraints (§3), new hooks (§4.1), the SSID rule with `clean()` and the iw drain to EOF (§5.5), the design summary (§5.11), tasks T10 to T14 (§6; the former T10 "self-test and deploy" is now T15), deploy of three files (§8) and the DoD (§9).
 
 Version 1.2, 2026-11-20. Author: BA. **v1.2 adds the security specialist's QA consultation requirements:**
@@ -488,3 +490,75 @@ mv -f ~/.local/bin/.panelgraph-daemon.new ~/.local/bin/panelgraph-daemon
 - [ ] v1.3 (F-25/F-26): AC-80 to AC-92 and AC-94 to AC-99 pass in the self-test (virtual X only, never `:0`); AC-01 to AC-79 re-run; AC-93 handed to the user as an install + hover checklist.
 - [ ] v1.3: `python3 -X dev -W error -m py_compile` on both Python files, `dash -n bin/panelgraph-show`, `bash -n install.sh`; the AC-22 and AC-92 static gates pass; the D-55 block is byte-identical in daemon and helper.
 - [ ] v1.3: no `__pycache__`, scratch paths or prototype leftovers committed. Privacy grep over the diff and new files (SEC-14): no MAC other than `aa:bb:cc:dd:ee:0N` and `02:00:00:00:00:xx`, no IPv4 other than `192.168.1.x` and `10.99.0.x`, no `/home/<user>` other than `/home/kali`, no real SSID; no live `net.txt`, `popup.json` or `popup.log` content in the docs.
+
+## 10. Code standard
+
+Binding for every change to `bin/panelgraph-daemon`, `bin/panelgraph-popup`, `bin/panelgraph-show` and `install.sh`. The reviewer rejects a change that breaks a rule here. Written by the tech lead for F-25 (v1.3) and kept for later work.
+
+### 10.1 Files and structure
+- The daemon is one file and the helper is one file: no packages, no modules next to them, no `__pycache__` in git.
+- Imports are stdlib only, plus `cairo`, imported lazily inside the render functions. The daemon never imports `ctypes`, `gi` or any X library.
+- File order: shebang and docstring; imports, alphabetical, one per line; constants; `PANELGRAPH_*` env constants; pure helpers; classes; `run()`; `main()`; `if __name__ == "__main__": sys.exit(main())`.
+- No side effects at import time beyond computing constants (no X connection, chdir, file write or signal handler), so QA can load a file with `SourceFileLoader`.
+
+### 10.2 Constants and env hooks
+- Every tunable number or string (timings, paddings, colours, caps, backoffs, exit codes) is an `UPPER_SNAKE` constant in the top block, with a trailing comment giving the unit and the spec id, e.g. `SHOW_DELAY = 0.5  # s hover before show (D-49)`. No magic numbers in function bodies, except 0, 1 and obvious indices.
+- Env overrides are named `PANELGRAPH_*` and read once at import. A malformed value falls back to the default without raising, or is ignored with a log entry. Every hook is listed in `requirements.md` §4.0, the README testing table and §4.1 here.
+- `/sys/class/net`, `/proc/net`, `/proc/sys/net` and `/sys/class/ieee80211` appear only as defaults of the `PANELGRAPH_*` constants (AC-22).
+- Colours come only from the palette constants (`requirements.md` §4.1) and the helper's popup colours. `#FF2020` appears only in the alert frame.
+
+### 10.3 Naming and style
+- `snake_case` functions, methods and locals; `CapWords` classes; a leading underscore for internals (`_drain`, `_finish`). Methods use the existing verbs: `poll(now)`, `alive()`, `kill()`, `update()`, `fail()`, `scan()`, `tick()`.
+- Short locals (`c`, `k`, `st`, `now`) are fine in tight loops; anything that lives longer than about 10 lines gets a descriptive name.
+- 4-space indent, lines ≤ 110 characters, double quotes, f-strings. No type annotations (ctypes field and argtype declarations are not annotations). `__slots__` on small per-interface or per-row value classes.
+
+### 10.4 Function size and shape
+- New functions: ≤ 40 lines and ≤ 3 levels of nesting. An X event dispatcher may reach 60 lines if it is a flat `if`/`elif` on the event type that calls one handler per transition.
+- One function does one thing. Keep pure computation (parsing, layout, placement) separate from X calls, so it can be probed without a display.
+- Do not grow `tooltip()` or `build()` with new logic; add a method and call it.
+- No copy-paste between the daemon and the helper, except the runtime-dir resolver and `secure_dir()`. That block stays byte-identical in both files, marked by a comment (D-55), and QA diffs it.
+
+### 10.5 Error handling
+- Daemon: every auxiliary step has its own `try`/`except`, logs through `log_once(key, repr(e))` with a stable key, and never sets the "!" marker or touches `net.txt`/`mem.txt` (D-30). `except Exception` is allowed only at those auxiliary boundaries and the graph boundaries in `run()`; everywhere else catch the narrow exception (`OSError`, `ValueError`, `ProcessLookupError`, `BlockingIOError`).
+- No bare `except:`. No `except Exception: pass` without a comment that says why silence is correct.
+- Helper: messages go to `popup.log` through `log_once` (bounded by `POPUP_LOG_MAX`, D-54). Render, load and place failures keep the last good state and never exit. Only the named exit codes are used (`EXIT_OK`, `EXIT_CRASH`, `EXIT_BUSY`, `EXIT_UNAVAILABLE`).
+- No `print()`, no stderr output (stderr is DEVNULL), and no traceback anywhere except `error.log` or `popup.log`.
+
+### 10.6 Subprocess and cost (NFR-4)
+- Exactly two `Popen` sites: `IwRunner` and `PopupHelper`. Each uses an argv list, `stdin`/`stderr=DEVNULL` (the helper also `stdout=DEVNULL`), `close_fds=True` and `start_new_session=True`. Never `subprocess.run`/`call`/`check_output`, `shell=True`, `os.system`, `os.popen`, `nmcli`, `ip` or `ss`. The helper spawns nothing (it loads library sonames directly, because `ctypes.util.find_library` runs `ldconfig`).
+- Per-tick daemon work stays O(strips); anything heavier goes into the `SLOW_EVERY` block. State the per-tick cost of new daemon code in µs in the commit message.
+- Helper: no timers and no pointer polling while hidden (the select timeout is `None` in IDLE), except the 2 s re-attach retry while DETACHED.
+
+### 10.7 Files and atomicity
+- Every runtime-file write goes through `write_atomic` (`path + ".tmp"`, then `os.replace`); `popup.log` is the one append-only file.
+- The helper writes only `popup.pid`, `popup.pid.tmp`, `popup.lock` and `popup.log`. Its reads use `O_NOFOLLOW`, an `fstat` `S_ISREG` check and a size cap.
+- Remove a pid file only when it holds our own pid.
+
+### 10.8 POSIX sh (`bin/panelgraph-show`)
+- The hot path uses dash builtins only (`case`, `[`, `read`, `printf`, `echo`, `true`, `while`). A new exec is allowed only in the rare "daemon not running" branch.
+- Put `2>/dev/null` before `>` on a redirection whose failure must not kill dash, and do not redirect `:`; use `true` or `printf`.
+- No bashisms (`[[ ]]`, `$UID`, arrays, `local`, `source`, `$'…'`); `dash -n` must pass. `test -O` and `-ef` are deliberate: dash, bash and busybox support them, and a strictly POSIX check would need an exec on the hot path.
+- Every added line has a comment with the reason and the spec id. AC-02 output stays byte-identical.
+
+### 10.9 ctypes (helper)
+- One declaration table: each library function is bound once, with `restype` and `argtypes` set. Calling an unbound ctypes function is forbidden.
+- Structs are `ctypes.Structure`/`Union` subclasses named after the Xlib type; no numeric pointer offsets.
+- X constants are named module constants (`EnterWindowMask = 1 << 4`, …), which keeps the AC-92 static gate greppable.
+- Keep `CFUNCTYPE` callbacks referenced at module level. `XFree` everything Xlib allocates, and nothing it does not.
+
+### 10.10 Comments and docstrings
+- Comments explain why, cite the constraint or spec id (D-xx, F-xx, AC-xx, NFR-x) or warn about a trap. No comments that restate the code.
+- Every class and non-trivial function has a one- to three-line docstring that says what it guarantees, not how.
+- English only. No real SSIDs, MACs, IPs or usernames in code, comments, fixtures or docs: use `HomeNet`, `aa:bb:cc:dd:ee:0N`, `192.168.1.x` and the sandbox's `10.99.0.x` / `02:00:…` values.
+
+### 10.11 No dead code
+- No commented-out code, unused imports, constants or parameters, debug flags, prototype leftovers or hard-coded scratch paths. Every env hook and constant is used and documented.
+
+### 10.12 Dependencies and install
+- No new runtime dependency unless it ships with a standard Kali XFCE install and is listed in the README Requirements.
+- A missing optional library degrades the feature, never the graph: the helper exits `EXIT_UNAVAILABLE` and the daemon backs off for 300 s.
+- `install.sh` and the README Uninstall section list every file in `bin/`.
+
+### 10.13 Commits and static analysis
+- Each commit compiles with `python3 -X dev -W error -m py_compile` on both Python files and passes `dash -n` / `bash -n`. English messages, one topic per commit, no unrelated refactors.
+- Before merge, run bandit, ruff, pyflakes3 and shellcheck against `main` and justify every new non-style finding (fix it, or waive it with the rule it follows).
