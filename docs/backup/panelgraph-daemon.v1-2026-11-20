@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""Draw cpugraph-style RAM and network history graphs for xfce4-genmon-plugin.
+
+Samples every INTERVAL seconds and keeps PNGs + genmon markup in
+$XDG_RUNTIME_DIR/panelgraph/. Started on demand by panelgraph-show; exits
+when no genmon has asked for output for IDLE_EXIT seconds.
+"""
+import fcntl
+import html
+import os
+import signal
+import sys
+import time
+import traceback
+from collections import deque
+
+# --- look: copied from the cpugraph plugin settings (xfconf /plugins/plugin-13) ---
+FG1 = (0.152941, 0.466667, 1.0)      # graph bottom (foreground-1)
+FG2 = (0.0, 1.0, 0.878431)           # graph top (foreground-2), gradient mode
+BARS = (0.0, 1.0, 0.878431)          # current-value bars (bars-color)
+DOWN = (1.0, 0.309804, 0.0)          # download columns + bar (netload Color_In rgb(255,79,0))
+UP = (1.0, 0.898039, 0.0)            # upload columns + bar (netload Color_Out rgb(255,229,0))
+HISTORY = 128                        # graph width in px, 1 px per sample
+HEIGHT = 32                          # panel size 34 minus genmon's 1 px padding top and bottom
+BAR_W, BAR_GAP = 4, 2                # cpugraph per-core bar geometry
+INTERVAL = 0.25                      # cpugraph "Fastest (~250ms)"
+NET_FLOOR = 64 * 1024                # minimum full-scale for the net graph, B/s
+NET_SMOOTH = 4                       # average net rates over this many samples (1 s);
+                                     # NICs deliver traffic in bursts shorter than INTERVAL
+IDLE_EXIT = 30                       # seconds without a genmon call before exiting
+ERROR_RETRY = 5                      # seconds a failing graph waits before trying again
+FATAL_HOLD = 30                      # linger after a fatal error so genmon doesn't respawn us 8x/s
+CLICK = "xfce4-taskmanager"
+PROC_NAME = "panelgraph"             # /proc/<pid>/comm, checked by panelgraph-show
+ARPHRD_ETHER = 1                     # /sys/class/net/<if>/type of wired and managed-mode Wi-Fi
+
+DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "panelgraph")
+PIDFILE = os.path.join(DIR, "pid")
+LOCK = os.path.join(DIR, "lock")
+SEEN = os.path.join(DIR, "seen")
+
+
+def read_meminfo():
+    info = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            key, val = line.split(":", 1)
+            info[key] = int(val.split()[0]) * 1024
+    return info
+
+
+def physical_ifaces():
+    """Wired and wireless NICs: interfaces backed by a real device, which
+    leaves out lo, docker, libvirt bridges, vnet/tun/veth and friends. Wi-Fi
+    cards in monitor mode change type to radiotap and are skipped, so sniffed
+    frames don't count as traffic."""
+    try:
+        names = os.listdir("/sys/class/net")
+    except OSError:
+        return []
+    ifaces = []
+    for n in sorted(names):
+        try:
+            with open(f"/sys/class/net/{n}/type") as f:
+                if int(f.read()) != ARPHRD_ETHER:
+                    continue
+        except (OSError, ValueError):
+            continue
+        if os.path.exists(f"/sys/class/net/{n}/device"):
+            ifaces.append(n)
+    return ifaces
+
+
+def is_up(iface):
+    """Operationally up (link + carrier). Some drivers never report and say
+    "unknown"; count those as up rather than hide a working NIC."""
+    try:
+        with open(f"/sys/class/net/{iface}/operstate") as f:
+            return f.read().strip() in ("up", "unknown")
+    except OSError:
+        return False
+
+
+def read_counters(ifaces):
+    counters = {}
+    for iface in ifaces:
+        base = f"/sys/class/net/{iface}/statistics/"
+        try:
+            with open(base + "rx_bytes") as rx, open(base + "tx_bytes") as tx:
+                counters[iface] = (int(rx.read()), int(tx.read()))
+        except OSError:
+            pass  # interface vanished (USB unplugged etc.)
+    return counters
+
+
+def human(n, suffix="B"):
+    for unit in ("", "K", "M", "G", "T"):
+        if abs(n) < 1024 or unit == "T":
+            return f"{n:.1f} {unit}i{suffix}" if unit else f"{n:.0f} {suffix}"
+        n /= 1024
+
+
+def px(frac):
+    # any activity gets at least 1 px, so small upload stays visible next to big download
+    return max(1, round(min(1.0, frac) * HEIGHT)) if frac > 0 else 0
+
+
+def write_atomic(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def write_fallback(path, data):
+    """write_atomic, or when that fails (directory not writable, tmpfs full)
+    overwrite the existing file in place: that needs no new directory entry,
+    and the short error text fits the page the file already has."""
+    try:
+        write_atomic(path, data)
+    except OSError:
+        with open(path, "r+") as f:
+            f.write(data)
+            f.truncate()
+
+
+def log_error(msg):
+    try:
+        write_fallback(os.path.join(DIR, "error.log"),
+                       time.strftime("%Y-%m-%d %H:%M:%S ") + msg)
+    except OSError:
+        pass
+
+
+def show_error(name, exc):
+    """Replace a graph's panel item with a "!" so a failure doesn't pass for a
+    frozen but healthy graph. Best effort: the disk may be what's failing."""
+    tip = (f"panelgraph {name} error: {traceback.format_exception_only(exc)[-1].strip()[:200]}\n"
+           f"see {os.path.join(DIR, 'error.log')}")
+    try:
+        write_fallback(os.path.join(DIR, name + ".txt"),
+                       f"<txt>!</txt><click>{CLICK}</click>"
+                       f"<tool>{html.escape(tip, quote=False)}</tool>\n")
+    except OSError:
+        pass
+
+
+def ensure_pidfile():
+    """Put our pid back if the pid file went missing or was overwritten;
+    without it panelgraph-show can't tell that we're running."""
+    me = str(os.getpid())
+    try:
+        with open(PIDFILE) as f:
+            if f.read().strip() == me:
+                return
+    except OSError:
+        pass
+    write_atomic(PIDFILE, me)
+
+
+def lost_lock(lock):
+    """True when the lock path no longer names the file we hold the flock on
+    (lock file or the whole directory deleted). panelgraph-show then finds the
+    lock free and starts a new owner, and two of us would fight over the pid
+    file and render into the same .tmp files, so the old owner has to go."""
+    try:
+        st = os.stat(LOCK)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False  # can't tell; keep going rather than flap
+    fs = os.fstat(lock.fileno())
+    return (st.st_dev, st.st_ino) != (fs.st_dev, fs.st_ino)
+
+
+class Graph:
+    """One genmon image + markup file. Re-renders only when pixels change."""
+
+    def __init__(self, name):
+        self.name = name
+        self.png = os.path.join(DIR, name + ".png")
+        self.txt = os.path.join(DIR, name + ".txt")
+        self.last_key = None
+        self.last_text = None
+        self.retry_at = 0.0  # monotonic time before which a failing graph is left alone
+
+    def fail(self, exc):
+        """Log the current exception, show it on the panel and back off."""
+        log_error(f"{self.name}: {traceback.format_exc()}")
+        show_error(self.name, exc)
+        # forget what's on disk so the next good tick rewrites both files
+        self.last_key = self.last_text = None
+        self.retry_at = time.monotonic() + ERROR_RETRY
+
+    def update(self, series, bars, tooltip):
+        """series: list of (values 0..1, color or None for the cpugraph gradient),
+        drawn as filled columns, newest on the right. With several series each
+        column is painted largest value first, so a smaller value stays visible
+        on top of a larger one. bars: list of (value 0..1, color)."""
+        bar_h = [px(frac) for frac, _ in bars]
+        n = len(series[0][0])
+        cols = [[px(values[i]) for values, _ in series] for i in range(n)]
+        key = (bar_h, cols)
+        # the exists() checks redraw files someone deleted behind our back
+        if key != self.last_key or not os.path.exists(self.png):
+            self._render(series, bars, bar_h, cols)
+            self.last_key = key
+
+        text = (f"<img>{self.png}</img><click>{CLICK}</click>"
+                f"<tool>{html.escape(tooltip, quote=False)}</tool>\n")
+        if text != self.last_text or not os.path.exists(self.txt):
+            write_atomic(self.txt, text)
+            self.last_text = text
+
+    def _render(self, series, bars, bar_h, cols):
+        import cairo
+
+        width = len(bars) * (BAR_W + BAR_GAP) + HISTORY
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, HEIGHT)
+        cr = cairo.Context(surf)
+        cr.set_antialias(cairo.ANTIALIAS_NONE)
+
+        for i, ((_, color), h) in enumerate(zip(bars, bar_h)):
+            if h:
+                cr.set_source_rgb(*color)
+                cr.rectangle(i * (BAR_W + BAR_GAP), HEIGHT - h, BAR_W, h)
+                cr.fill()
+
+        sources = []
+        for _, color in series:
+            if color is None:
+                grad = cairo.LinearGradient(0, HEIGHT, 0, 0)
+                grad.add_color_stop_rgb(0, *FG1)
+                grad.add_color_stop_rgb(1, *FG2)
+                sources.append(grad)
+            else:
+                sources.append(cairo.SolidPattern(*color))
+
+        offset = len(bars) * (BAR_W + BAR_GAP) + HISTORY - len(cols)
+        # rank[i][s]: paint layer of series s in column i (0 = largest, painted first)
+        ranks = []
+        for heights in cols:
+            order = sorted(range(len(heights)), key=lambda s: heights[s], reverse=True)
+            rank = [0] * len(heights)
+            for r, s in enumerate(order):
+                rank[s] = r
+            ranks.append(rank)
+        # columns never overlap, so each (layer, series) is one path and one fill
+        for layer in range(len(series)):
+            for s, src in enumerate(sources):
+                for i, heights in enumerate(cols):
+                    h = heights[s]
+                    if h and ranks[i][s] == layer:
+                        cr.rectangle(offset + i, HEIGHT - h, 1, h)
+                cr.set_source(src)
+                cr.fill()
+
+        tmp = self.png + ".tmp"
+        surf.write_to_png(tmp)
+        os.replace(tmp, self.png)
+
+
+def run(lock):
+    mem = Graph("mem")
+    net = Graph("net")
+    mem_hist = deque(maxlen=HISTORY)
+    rx_hist = deque(maxlen=HISTORY)
+    tx_hist = deque(maxlen=HISTORY)
+    window = deque(maxlen=NET_SMOOTH)  # (seconds, rx bytes, tx bytes) per sample
+    ifaces, up, prev, prev_t, tick = [], [], None, None, 0
+
+    # idle detection on the monotonic clock: wall-clock jumps and suspend
+    # must not look like "nobody has called us for 30 s"
+    open(SEEN, "a").close()
+    seen_mtime = os.stat(SEEN).st_mtime_ns
+    seen_at = time.monotonic()
+
+    while True:
+        start = time.monotonic()
+        # two stats per tick; checked before anything is written so a
+        # replaced owner never touches the new owner's files
+        if lost_lock(lock):
+            return
+        if tick % 20 == 0:  # every ~5 s
+            ifaces = physical_ifaces()  # pick up plugged/unplugged NICs
+            # all of them are summed (a down NIC adds 0), but the tooltip
+            # names only the ones carrying traffic
+            up = [i for i in ifaces if is_up(i)]
+            try:
+                ensure_pidfile()
+            except OSError:
+                log_error(traceback.format_exc())
+
+        # each graph fails and backs off on its own, so one can't freeze the other
+        if start >= mem.retry_at:
+            try:
+                m = read_meminfo()
+                total, avail = m["MemTotal"], m["MemAvailable"]
+                used = total - avail
+                mem_hist.append(used / total)
+                swap_used = m["SwapTotal"] - m["SwapFree"]
+                mem.update([(mem_hist, None)],
+                           [(used / total, BARS)],
+                           f"RAM: {human(used)} / {human(total)} ({100 * used / total:.0f}%)\n"
+                           f"Swap: {human(swap_used)} / {human(m['SwapTotal'])}")
+            except Exception as e:
+                mem.fail(e)
+
+        if start >= net.retry_at:
+            try:
+                now = time.monotonic()
+                cur = read_counters(ifaces)
+                if prev is not None:
+                    # only interfaces present in both samples; a counter reset counts as 0
+                    common = cur.keys() & prev.keys()
+                    window.append((now - prev_t,
+                                   sum(max(0, cur[i][0] - prev[i][0]) for i in common),
+                                   sum(max(0, cur[i][1] - prev[i][1]) for i in common)))
+                    span = sum(w[0] for w in window)
+                    rx_hist.append(sum(w[1] for w in window) / span)
+                    tx_hist.append(sum(w[2] for w in window) / span)
+                prev, prev_t = cur, now
+
+                scale = max([NET_FLOOR, *rx_hist, *tx_hist])
+                rx_now = rx_hist[-1] if rx_hist else 0
+                tx_now = tx_hist[-1] if tx_hist else 0
+                net.update([([v / scale for v in rx_hist], DOWN),
+                            ([v / scale for v in tx_hist], UP)],
+                           [(rx_now / scale, DOWN), (tx_now / scale, UP)],
+                           f"{', '.join(up) or ('no interface up' if ifaces else 'no network interfaces')}\n"
+                           f"Down: {human(rx_now, 'B/s')}\n"
+                           f"Up: {human(tx_now, 'B/s')}\n"
+                           f"Scale: {human(scale, 'B/s')}")
+            except Exception as e:
+                net.fail(e)
+
+        tick += 1
+        try:
+            mtime = os.stat(SEEN).st_mtime_ns
+        except OSError:
+            mtime = None
+        if mtime != seen_mtime:
+            seen_mtime, seen_at = mtime, time.monotonic()
+        elif time.monotonic() - seen_at > IDLE_EXIT:
+            return
+        time.sleep(max(0.0, INTERVAL - (time.monotonic() - start)))
+
+
+def main():
+    # genmon waits for EOF on every pipe its command holds; drop the copies we
+    # inherited from panelgraph-show or the panel item that launched us freezes.
+    os.closerange(3, os.sysconf("SC_OPEN_MAX"))
+    locked = False
+    try:
+        os.makedirs(DIR, exist_ok=True)
+        # panelgraph-show checks /proc/<pid>/cwd against DIR, so a pid file
+        # pointing at a "panelgraph" serving another runtime dir isn't trusted
+        os.chdir(DIR)
+        lock = open(LOCK, "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # another instance is already running
+        locked = True
+
+        with open("/proc/self/comm", "w") as f:
+            f.write(PROC_NAME)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        write_atomic(PIDFILE, str(os.getpid()))
+        run(lock)
+    except Exception as e:
+        log_error(traceback.format_exc())
+        # Only linger while holding the lock: panelgraph-show doesn't start a
+        # daemon while the lock is taken, so holding it stops the respawns.
+        # Without it, lingering would just pile up sleeping copies.
+        if locked:
+            for name in ("mem", "net"):
+                show_error(name, e)
+            time.sleep(FATAL_HOLD)
+        return 1
+    finally:
+        if locked:
+            try:
+                with open(PIDFILE) as f:
+                    if f.read().strip() == str(os.getpid()):
+                        os.unlink(PIDFILE)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

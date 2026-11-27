@@ -1,0 +1,27 @@
+#!/bin/sh
+# genmon command: panelgraph-show mem|net
+# Prints the markup kept by panelgraph-daemon, starting the daemon if needed.
+# Runs 8x/s across both panel items, so it sticks to shell builtins.
+d="${XDG_RUNTIME_DIR:-/tmp}/panelgraph"
+pid= comm=
+read -r pid 2>/dev/null < "$d/pid"
+[ -n "$pid" ] && read -r comm 2>/dev/null < "/proc/$pid/comm"
+# the comm check guards against a stale pid file whose pid got reused; the
+# cwd check (the daemon chdirs into $d) against a daemon serving another dir
+if [ "$comm" != panelgraph ] || ! [ "/proc/$pid/cwd" -ef "$d" ]; then
+    mkdir -p "$d"
+    # a daemon that lost its pid file or lingers after a fatal error still holds
+    # the lock; only start one when the lock is free (this path is rare, so the
+    # extra exec doesn't matter)
+    if flock -n "$d/lock" true 2>/dev/null; then
+        setsid -f "$HOME/.local/bin/panelgraph-daemon" >/dev/null 2>&1 </dev/null
+    fi
+fi
+# true, not ":": a failed redirection on a special builtin exits dash, and the
+# 2> has to come first to swallow the message
+true 2>/dev/null > "$d/seen"
+if [ -r "$d/$1.txt" ]; then
+    while IFS= read -r line; do printf '%s\n' "$line"; done < "$d/$1.txt"
+else
+    echo "<txt>…</txt>"
+fi

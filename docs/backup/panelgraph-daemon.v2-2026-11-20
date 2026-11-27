@@ -1,0 +1,1411 @@
+#!/usr/bin/env python3
+"""Draw cpugraph-style RAM and network history graphs for xfce4-genmon-plugin.
+
+Samples every INTERVAL seconds and keeps PNGs + genmon markup in
+$XDG_RUNTIME_DIR/panelgraph/. Started on demand by panelgraph-show; exits
+when no genmon has asked for output for IDLE_EXIT seconds.
+
+Network graph v2 (see ~/.local/share/panelgraph/requirements.md):
+per-card strips, monitor-mode traffic in its own magenta strip that is never
+added to the managed total, Wi-Fi details and security lines in the tooltip.
+"""
+import fcntl
+import html
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import traceback
+import unicodedata
+from collections import deque
+from itertools import islice
+
+# --- look: copied from the cpugraph plugin settings (xfconf /plugins/plugin-13) ---
+FG1 = (0.152941, 0.466667, 1.0)      # graph bottom (foreground-1)
+FG2 = (0.0, 1.0, 0.878431)           # graph top (foreground-2), gradient mode
+BARS = (0.0, 1.0, 0.878431)          # current-value bars (bars-color)
+DOWN = (1.0, 79 / 255, 0.0)          # #FF4F00 managed download (netload Color_In rgb(255,79,0))
+UP = (1.0, 229 / 255, 0.0)           # #FFE500 managed upload (netload Color_Out rgb(255,229,0))
+MON_RX = (1.0, 0.0, 1.0)             # #FF00FF monitor captured rx (+ baseline marker)
+MON_TX = (1.0, 160 / 255, 1.0)       # #FFA0FF monitor injected tx
+ALERT = (1.0, 32 / 255, 32 / 255)    # #FF2020 gateway-MAC alert frame, used nowhere else
+HEX = {"down": "FF4F00", "up": "FFE500", "mrx": "FF00FF", "mtx": "FFA0FF"}
+HISTORY = 128                        # graph width in px, 1 px per sample
+HEIGHT = 32                          # panel size 34 minus genmon's 1 px padding top and bottom
+WIDTH = 2 * (4 + 2) + HISTORY        # net image: 2 bars + gaps + history = 140
+BAR_W, BAR_GAP = 4, 2                # cpugraph per-core bar geometry
+INTERVAL = 0.25                      # cpugraph "Fastest (~250ms)"
+NET_FLOOR = 64 * 1024                # minimum full-scale for the net graph, B/s
+NET_SMOOTH = 4                       # average net rates over this many samples (1 s);
+                                     # NICs deliver traffic in bursts shorter than INTERVAL
+IDLE_EXIT = 30                       # seconds without a genmon call before exiting
+ERROR_RETRY = 5                      # seconds a failing graph waits before trying again
+FATAL_HOLD = 30                      # linger after a fatal error so genmon doesn't respawn us 8x/s
+CLICK = "xfce4-taskmanager"
+PROC_NAME = "panelgraph"             # /proc/<pid>/comm, checked by panelgraph-show
+
+# --- data sources; overridable for the QA sandbox (requirements 4.0, F-02) ---
+SYSNET = os.environ.get("PANELGRAPH_SYSNET", "/sys/class/net")
+PROCNET = os.environ.get("PANELGRAPH_PROCNET", "/proc/net")
+IPFORWARD = os.environ.get("PANELGRAPH_IPFORWARD", "/proc/sys/net/ipv4/ip_forward")
+ADDRS_FILE = os.environ.get("PANELGRAPH_ADDRS")            # None -> SIOCGIFADDR ioctl
+IW = os.environ.get("PANELGRAPH_IW") or shutil.which("iw") or "/usr/sbin/iw"
+try:
+    ALERT_HOLD = float(os.environ.get("PANELGRAPH_ALERT_HOLD", "600"))
+except ValueError:
+    ALERT_HOLD = 600.0
+
+ARPHRD_ETHER, ARPHRD_NONE, ARPHRD_PPP = 1, 65534, 512
+MONITOR_TYPES = {801, 802, 803}      # ieee80211 / prism / radiotap
+IFF_UP, IFF_PROMISC = 0x1, 0x100
+RTF_UP, RTF_GATEWAY = 0x1, 0x2
+ATF_COM = 0x2
+SIOCGIFADDR = 0x8915
+VRRP_PREFIXES = ("00:00:5e:00:01:", "00:00:5e:00:02:", "00:00:0c:07:ac:")
+IW_TIMEOUT = 1.0
+IW_STALE = 30                        # s a failed iw command may show its last good data
+LOG_ONCE_PERIOD = 600
+MAX_STRIPS = 3
+WWAN_ENABLED = True                  # F-15: type 65534 with a device link counts as managed
+NOTE_TIME = 600                      # s "Gateway MAC accepted" / "Default route moved" stay
+SLOW_EVERY = 20                      # ticks between slow scans (~5 s)
+
+DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "panelgraph")
+PIDFILE = os.path.join(DIR, "pid")
+LOCK = os.path.join(DIR, "lock")
+SEEN = os.path.join(DIR, "seen")
+GWJSON = os.path.join(DIR, "gw.json")
+
+
+def read_meminfo():
+    info = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            key, val = line.split(":", 1)
+            info[key] = int(val.split()[0]) * 1024
+    return info
+
+
+def rd(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def human(n, suffix="B"):
+    for unit in ("", "K", "M", "G", "T"):
+        if abs(n) < 1024 or unit == "T":
+            return f"{n:.1f} {unit}i{suffix}" if unit else f"{n:.0f} {suffix}"
+        n /= 1024
+
+
+def px(frac):
+    # any activity gets at least 1 px, so small upload stays visible next to big download
+    return max(1, round(min(1.0, frac) * HEIGHT)) if frac > 0 else 0
+
+
+def vh(v, scale, h):
+    """Height in px of value v in a strip of height h (requirements 4.1)."""
+    return max(1, round(min(1.0, v / scale) * h)) if v > 0 else 0
+
+
+def esc(s):
+    """Escape one untrusted value for Pango markup (never the assembled markup)."""
+    return html.escape(str(s).encode("utf-8", "replace").decode("utf-8"), quote=False)
+
+
+def glyph(hx):
+    return f'<span foreground="#{hx}">■</span>'
+
+
+def decode_ssid(ssid):
+    """iw prints non-printables, edge spaces and '\\' as \\xNN. Decode, drop
+    control characters, truncate; the caller escapes at interpolation time."""
+    raw = re.sub(rb"\\x([0-9a-fA-F]{2})", lambda m: bytes([int(m[1], 16)]),
+                 ssid.encode("utf-8", "surrogateescape"))
+    s = raw.decode("utf-8", "replace")
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Cc")[:32]
+
+
+def hhmm(epoch, fmt="%H:%M"):
+    return time.strftime(fmt, time.localtime(epoch))
+
+
+def write_atomic(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def write_fallback(path, data):
+    """write_atomic, or when that fails (directory not writable, tmpfs full)
+    overwrite the existing file in place: that needs no new directory entry,
+    and the short error text fits the page the file already has."""
+    try:
+        write_atomic(path, data)
+    except OSError:
+        with open(path, "r+", encoding="utf-8") as f:
+            f.write(data)
+            f.truncate()
+
+
+def log_error(msg):
+    try:
+        write_fallback(os.path.join(DIR, "error.log"),
+                       time.strftime("%Y-%m-%d %H:%M:%S ") + msg)
+    except OSError:
+        pass
+
+
+_LOGGED = {}
+
+
+def log_once(key, msg):
+    """Auxiliary-data failures: at most one error.log entry per key per 10 min,
+    and no "!" marker (D-30)."""
+    now = time.monotonic()
+    last = _LOGGED.get(key)
+    if last is None or now - last >= LOG_ONCE_PERIOD:
+        _LOGGED[key] = now
+        log_error(f"net aux [{key}]: {msg}\n")
+
+
+def show_error(name, exc):
+    """Replace a graph's panel item with a "!" so a failure doesn't pass for a
+    frozen but healthy graph. Best effort: the disk may be what's failing."""
+    tip = (f"panelgraph {name} error: {traceback.format_exception_only(exc)[-1].strip()[:200]}\n"
+           f"see {os.path.join(DIR, 'error.log')}")
+    try:
+        write_fallback(os.path.join(DIR, name + ".txt"),
+                       f"<txt>!</txt><click>{CLICK}</click>"
+                       f"<tool>{html.escape(tip, quote=False)}</tool>\n")
+    except OSError:
+        pass
+
+
+def ensure_pidfile():
+    """Put our pid back if the pid file went missing or was overwritten;
+    without it panelgraph-show can't tell that we're running."""
+    me = str(os.getpid())
+    try:
+        with open(PIDFILE) as f:
+            if f.read().strip() == me:
+                return
+    except OSError:
+        pass
+    write_atomic(PIDFILE, me)
+
+
+def lost_lock(lock):
+    """True when the lock path no longer names the file we hold the flock on
+    (lock file or the whole directory deleted). panelgraph-show then finds the
+    lock free and starts a new owner, and two of us would fight over the pid
+    file and render into the same .tmp files, so the old owner has to go."""
+    try:
+        st = os.stat(LOCK)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False  # can't tell; keep going rather than flap
+    fs = os.fstat(lock.fileno())
+    return (st.st_dev, st.st_ino) != (fs.st_dev, fs.st_ino)
+
+
+class Graph:
+    """One genmon image + markup file. Re-renders only when pixels change.
+    Used as is for the (deferred) RAM graph."""
+
+    def __init__(self, name):
+        self.name = name
+        self.png = os.path.join(DIR, name + ".png")
+        self.txt = os.path.join(DIR, name + ".txt")
+        self.last_key = None
+        self.last_text = None
+        self.retry_at = 0.0  # monotonic time before which a failing graph is left alone
+
+    def fail(self, exc):
+        """Log the current exception, show it on the panel and back off."""
+        log_error(f"{self.name}: {traceback.format_exc()}")
+        show_error(self.name, exc)
+        # forget what's on disk so the next good tick rewrites both files
+        self.last_key = self.last_text = None
+        self.retry_at = time.monotonic() + ERROR_RETRY
+
+    def update(self, series, bars, tooltip):
+        """series: list of (values 0..1, color or None for the cpugraph gradient),
+        drawn as filled columns, newest on the right. With several series each
+        column is painted largest value first, so a smaller value stays visible
+        on top of a larger one. bars: list of (value 0..1, color)."""
+        bar_h = [px(frac) for frac, _ in bars]
+        n = len(series[0][0])
+        cols = [[px(values[i]) for values, _ in series] for i in range(n)]
+        key = (bar_h, cols)
+        # the exists() checks redraw files someone deleted behind our back
+        if key != self.last_key or not os.path.exists(self.png):
+            self._render(series, bars, bar_h, cols)
+            self.last_key = key
+
+        text = (f"<img>{self.png}</img><click>{CLICK}</click>"
+                f"<tool>{html.escape(tooltip, quote=False)}</tool>\n")
+        if text != self.last_text or not os.path.exists(self.txt):
+            write_atomic(self.txt, text)
+            self.last_text = text
+
+    def _render(self, series, bars, bar_h, cols):
+        import cairo
+
+        width = len(bars) * (BAR_W + BAR_GAP) + HISTORY
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, HEIGHT)
+        cr = cairo.Context(surf)
+        cr.set_antialias(cairo.ANTIALIAS_NONE)
+
+        for i, ((_, color), h) in enumerate(zip(bars, bar_h)):
+            if h:
+                cr.set_source_rgb(*color)
+                cr.rectangle(i * (BAR_W + BAR_GAP), HEIGHT - h, BAR_W, h)
+                cr.fill()
+
+        sources = []
+        for _, color in series:
+            if color is None:
+                grad = cairo.LinearGradient(0, HEIGHT, 0, 0)
+                grad.add_color_stop_rgb(0, *FG1)
+                grad.add_color_stop_rgb(1, *FG2)
+                sources.append(grad)
+            else:
+                sources.append(cairo.SolidPattern(*color))
+
+        offset = len(bars) * (BAR_W + BAR_GAP) + HISTORY - len(cols)
+        # rank[i][s]: paint layer of series s in column i (0 = largest, painted first)
+        ranks = []
+        for heights in cols:
+            order = sorted(range(len(heights)), key=lambda s: heights[s], reverse=True)
+            rank = [0] * len(heights)
+            for r, s in enumerate(order):
+                rank[s] = r
+            ranks.append(rank)
+        # columns never overlap, so each (layer, series) is one path and one fill
+        for layer in range(len(series)):
+            for s, src in enumerate(sources):
+                for i, heights in enumerate(cols):
+                    h = heights[s]
+                    if h and ranks[i][s] == layer:
+                        cr.rectangle(offset + i, HEIGHT - h, 1, h)
+                cr.set_source(src)
+                cr.fill()
+
+        tmp = self.png + ".tmp"
+        surf.write_to_png(tmp)
+        os.replace(tmp, self.png)
+
+
+def strip_rows(n, H, y0):
+    """[(top, bottom)] rows of n strips in a content box of height H at y0;
+    one transparent separator row between strips (requirements 4.1)."""
+    usable = H - (n - 1)
+    base, extra = divmod(usable, n)
+    rows, y = [], y0
+    for k in range(n):
+        h = base + (1 if k >= n - extra else 0)
+        rows.append((y, y + h - 1))
+        y += h + 1
+    return rows
+
+
+class NetGraph(Graph):
+    """The network image: strips of (a, b) columns; see requirements 4.1.
+    layout = (alert, ((kind, (bar_a, bar_b), ((a, b) per column), lit or None), ...))
+    with all heights already in px; the layout itself is the pixel key."""
+
+    def update(self, layout, markup):
+        if layout != self.last_key or not os.path.exists(self.png):
+            self._render(layout)
+            self.last_key = layout
+        text = f"<img>{self.png}</img><click>{CLICK}</click><tool>{markup}</tool>\n"
+        if text != self.last_text or not os.path.exists(self.txt):
+            write_atomic(self.txt, text)
+            self.last_text = text
+
+    def _render(self, layout):
+        import cairo
+
+        alert, strips = layout
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, WIDTH, HEIGHT)
+        cr = cairo.Context(surf)
+        cr.set_antialias(cairo.ANTIALIAS_NONE)
+        x0, y0, W, H = (1, 1, WIDTH - 2, HEIGHT - 2) if alert else (0, 0, WIDTH, HEIGHT)
+        hx = x0 + W - HISTORY
+
+        def fill(color, rects):
+            if rects:
+                for r in rects:
+                    cr.rectangle(*r)
+                cr.set_source_rgb(*color)
+                cr.fill()
+
+        for (top, yb), (kind, bars, cols, lit) in zip(strip_rows(len(strips), H, y0), strips):
+            ca, cb = (MON_RX, MON_TX) if kind == "monitor" else (DOWN, UP)
+            fill(ca, [(x0, yb - bars[0] + 1, BAR_W, bars[0])] if bars[0] else [])
+            # the right bar stays at x 6-9 in both modes (alert: down 1-4, gap 5, up 6-9, gap 10)
+            fill(cb, [(BAR_W + BAR_GAP, yb - bars[1] + 1, BAR_W, bars[1])] if bars[1] else [])
+            if lit:
+                # baseline marker: history columns only, bottom row, painted first
+                fill(MON_RX, [(hx + i, yb, 1, 1) for i, on in enumerate(lit) if on])
+            first_a, first_b, second_a, second_b = [], [], [], []
+            for i, (ha, hb) in enumerate(cols):
+                x = hx + i
+                if ha >= hb:            # larger first; ties: a first, then b
+                    if ha:
+                        first_a.append((x, yb - ha + 1, 1, ha))
+                    if hb:
+                        second_b.append((x, yb - hb + 1, 1, hb))
+                else:
+                    first_b.append((x, yb - hb + 1, 1, hb))
+                    if ha:
+                        second_a.append((x, yb - ha + 1, 1, ha))
+            # columns never overlap, so all first-layer fills can precede the second layer
+            fill(ca, first_a)
+            fill(cb, first_b)
+            fill(ca, second_a)
+            fill(cb, second_b)
+        if alert:
+            fill(ALERT, [(0, 0, WIDTH, 1), (0, HEIGHT - 1, WIDTH, 1),
+                         (0, 1, 1, HEIGHT - 2), (WIDTH - 1, 1, 1, HEIGHT - 2)])
+
+        tmp = self.png + ".tmp"
+        surf.write_to_png(tmp)
+        os.replace(tmp, self.png)
+
+
+# --------------------------------------------------------------------------
+# network model
+# --------------------------------------------------------------------------
+
+class Iface:
+    """What we know about one name in SYSNET."""
+    __slots__ = ("name", "has_dev", "has_phy", "phy", "prev", "prev_kind", "kind", "type",
+                 "oper", "flags", "carrier", "ifindex", "admin_up")
+
+    def __init__(self, name):
+        self.name = name
+        self.has_dev = self.has_phy = False
+        self.phy = None
+        self.prev = self.prev_kind = self.kind = None
+        self.type = None
+        self.oper = ""
+        self.flags = 0
+        self.carrier = self.ifindex = None
+        self.admin_up = False
+
+    def check_links(self):
+        """device/phy80211 links and the phy name: on first sight and in every
+        slow scan, positive and negative results alike (D-32). The kernel can
+        list a name before it adds these links."""
+        p = f"{SYSNET}/{self.name}"
+        self.has_dev = os.path.exists(p + "/device")
+        self.has_phy = os.path.exists(p + "/phy80211")
+        phy = None
+        if self.has_phy:
+            try:
+                phy = rd(p + "/phy80211/name")
+            except OSError:
+                pass
+        self.phy = phy
+
+    def scan_attrs(self):
+        p = f"{SYSNET}/{self.name}/"
+        try:
+            self.type = int(rd(p + "type"))
+        except (OSError, ValueError):
+            self.type = None
+        cand = self.has_dev or self.has_phy
+        if cand or self.type in (ARPHRD_NONE, ARPHRD_PPP):
+            try:
+                self.oper = rd(p + "operstate")
+            except OSError:
+                self.oper = ""
+        if not cand:
+            return
+        try:
+            self.flags = int(rd(p + "flags"), 16)
+        except (OSError, ValueError):
+            pass
+        try:
+            self.carrier = int(rd(p + "carrier_changes"))
+        except (OSError, ValueError):
+            self.carrier = None
+        try:
+            idx = int(rd(p + "ifindex"))
+        except (OSError, ValueError):
+            idx = None
+        if idx is not None and self.ifindex is not None and idx != self.ifindex:
+            self.prev = None  # F-16: a different netdev under the same name; rebaseline
+        if idx is not None:
+            self.ifindex = idx
+
+    @property
+    def up(self):
+        return self.oper in ("up", "unknown")
+
+
+class Hist:
+    """HISTORY samples, pre-filled with zeros so all strips stay column-aligned,
+    with a count of nonzero entries (strip lifetime, key retirement)."""
+    __slots__ = ("d", "nz")
+
+    def __init__(self, zero):
+        self.d = deque([zero] * HISTORY, maxlen=HISTORY)
+        self.nz = 0
+
+    def append(self, v):
+        if any(self.d[0]):
+            self.nz -= 1
+        if any(v):
+            self.nz += 1
+        self.d.append(v)
+
+
+def parse_iw_dev(text):
+    """`iw dev` -> {ifname: {phy, ifindex, type, ssid, chan, freq, width}}."""
+    out, phy, cur, seen = {}, None, None, False
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        m = re.match(r"phy#(\d+)$", line)
+        if m:
+            phy, cur, seen = f"phy{m[1]}", None, True
+            continue
+        if line.startswith("Unnamed/non-netdev interface"):
+            cur, seen = None, True   # P2P-device: its "type" must not overwrite wlan0
+            continue
+        if line.startswith("Interface "):
+            cur = out[line[10:].strip()] = {"phy": phy}
+            seen = True
+            continue
+        if cur is None:
+            continue
+        if line.startswith("ifindex "):
+            try:
+                cur["ifindex"] = int(line[8:])
+            except ValueError:
+                pass
+        elif line.startswith("type "):
+            cur["type"] = line[5:]
+        elif line.startswith("ssid "):
+            cur["ssid"] = decode_ssid(raw.lstrip()[5:])
+        else:
+            m = re.match(r"channel (\d+) \((\d+) MHz\)(?:, width: (\d+) MHz)?", line)
+            if m:
+                cur["chan"], cur["freq"] = int(m[1]), int(m[2])
+                if m[3]:
+                    cur["width"] = int(m[3])
+    if not seen and text.strip():
+        raise ValueError("unrecognised iw dev output")
+    return out
+
+
+def parse_iw_link(text):
+    """`iw dev <if> link` -> {bssid, ssid, freq, signal, rx, tx}; {} if not connected."""
+    if not text.strip():
+        return {}
+    d = {}
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if line == "Not connected.":
+            return {}
+        m = re.match(r"Connected to ([0-9a-fA-F:]{17})", line)
+        if m:
+            d["bssid"] = m[1].lower()
+        elif line.startswith("SSID: "):
+            d["ssid"] = decode_ssid(raw.lstrip()[6:])
+        elif m := re.match(r"freq: ([\d.]+)", line):
+            d["freq"] = float(m[1])
+        elif m := re.match(r"signal: (-?\d+) dBm", line):
+            d["signal"] = int(m[1])
+        elif m := re.match(r"rx bitrate: ([\d.]+) MBit/s", line):
+            d["rx"] = float(m[1])
+        elif m := re.match(r"tx bitrate: ([\d.]+) MBit/s", line):
+            d["tx"] = float(m[1])
+    if "bssid" not in d:
+        raise ValueError("unrecognised iw link output")
+    return d
+
+
+class IwRunner:
+    """At most one iw child at a time, polled every tick, killed after
+    IW_TIMEOUT; never waits (D-19). results[key] = {ok_at, data, failed,
+    reason, at}, key = ("dev",) or ("link", ifname)."""
+
+    def __init__(self):
+        self.proc = None
+        self.key = None
+        self.started = 0.0
+        self.killed = False
+        self.buf = b""
+        self.results = {}
+        self.pending_link = None
+
+    def _drain(self):
+        fd = self.proc.stdout.fileno()
+        while len(self.buf) < 65536:
+            try:
+                chunk = os.read(fd, 65536)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                return
+            if not chunk:
+                return
+            self.buf += chunk
+
+    def _fail(self, key, reason, now):
+        r = self.results.setdefault(key, {"ok_at": None, "data": None})
+        r.update(failed=True, reason=reason, at=now)
+        log_once("iw:" + reason.split()[-1], f"iw {' '.join(key)}: {reason}")
+
+    def _finish(self, now):
+        text = self.buf.decode("utf-8", "surrogateescape")
+        try:
+            data = parse_iw_dev(text) if self.key[0] == "dev" else parse_iw_link(text)
+        except ValueError:
+            self._fail(self.key, "parse", now)
+            return
+        r = self.results.setdefault(self.key, {})
+        r.update(ok_at=now, data=data, failed=False, reason=None, at=now)
+
+    def poll(self, now, tick, any_phy, link_target):
+        if self.proc is not None:
+            self._drain()
+            if self.proc.poll() is None:
+                if not self.killed and now - self.started > IW_TIMEOUT:
+                    try:
+                        os.killpg(self.proc.pid, signal.SIGKILL)
+                    except OSError:
+                        try:
+                            self.proc.kill()
+                        except OSError:
+                            pass
+                    self.killed = True
+                    self._fail(self.key, "timeout", now)
+                return              # never start another until this one is reaped
+            if not self.killed:
+                self._finish(now)
+            try:
+                self.proc.stdout.close()
+            except OSError:
+                pass
+            self.proc = None
+        want = None
+        if self.pending_link:
+            want, self.pending_link = ("link", self.pending_link), None
+        elif tick % 40 == 0 and any_phy:
+            want = ("dev",)
+        elif tick % 40 == 20 and link_target:
+            want = ("link", link_target)
+        if want is None:
+            return
+        argv = [IW, "dev"] if want[0] == "dev" else [IW, "dev", want[1], "link"]
+        try:
+            self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, close_fds=True,
+                                         start_new_session=True)
+        except OSError:
+            self.proc = None
+            self._fail(want, "iw missing", now)
+            return
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        self.key, self.started, self.killed, self.buf = want, now, False, b""
+
+    def kill(self):
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def data(self, key):
+        r = self.results.get(key)
+        return (r or {}).get("data") or {}
+
+    def status(self, keys, now):
+        """None, ("stale", seconds) or ("unavailable", reason) for the given commands."""
+        stale = None
+        for key in keys:
+            r = self.results.get(key)
+            if not r or not r.get("failed"):
+                continue
+            if r.get("ok_at") is None or now - r["ok_at"] > IW_STALE:
+                return ("unavailable", r["reason"])
+            stale = max(stale or 0, now - r["ok_at"])
+        return None if stale is None else ("stale", stale)
+
+
+class GwWatch:
+    """M2 gateway-MAC alert (requirements 4.4) and S2 route moved (F-12)."""
+    KEYS = ("iface", "gw_ip", "mac", "carrier_changes", "bssid")
+
+    def __init__(self):
+        self.base = None
+        self.alert = None            # {since, old, new, iface, mismatch, clear_at}
+        self.line = None             # "!! ..." text; stays until exit or acceptance
+        self.pending = None          # (mac, monotonic time) of a first mismatch
+        self.loaded = False
+        self.written = None          # last state written to gw.json
+        self.accepted = None         # (text, monotonic time)
+        self.moved = None            # (text, monotonic time)
+        self.prev_route = None
+        self.prev_cc = None
+
+    def state(self):
+        b = self.base or {}
+        a = self.alert
+        st = {k: b.get(k) for k in self.KEYS}
+        st["alert_since"] = a["since"] if a else None
+        st["alert_mac"] = a["new"] if a else None
+        return st
+
+    def write(self):
+        st = self.state()
+        if st == self.written:
+            return
+        try:
+            write_atomic(GWJSON, json.dumps(st))
+            self.written = st
+        except OSError as e:
+            log_once("gwjson", repr(e))
+
+    def _fire_line(self, a):
+        self.line = (f"!! Gateway MAC changed {hhmm(a['since'])} {a['old']} → {a['new']}"
+                     f" via {a['iface']}")
+
+    def _load(self, cur):
+        try:
+            with open(GWJSON) as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(st, dict) or not st.get("mac"):
+            return
+        if (st.get("iface"), st.get("gw_ip"), st.get("carrier_changes")) != \
+                (cur["iface"], cur["gw_ip"], cur["carrier_changes"]):
+            return
+        self.base = {k: st.get(k) for k in self.KEYS}
+        self.written = dict(st)
+        if st.get("alert_since") and st.get("alert_mac"):
+            self.alert = {"since": st["alert_since"], "old": st["mac"], "new": st["alert_mac"],
+                          "iface": cur["iface"], "mismatch": True, "clear_at": None}
+            self._fire_line(self.alert)
+
+    def route_moved(self, now, route, cache):
+        """F-12: (iface, gw) changed between scans while the old iface kept its carrier."""
+        if self.prev_route and route and route != self.prev_route:
+            old = cache.get(self.prev_route[0])
+            if old is not None and old.carrier is not None and old.carrier == self.prev_cc:
+                self.moved = (f"Default route moved {self.prev_route[0]}→{route[0]} "
+                              f"{hhmm(time.time())}", now)
+        self.prev_route = route
+        c = cache.get(route[0]) if route else None
+        self.prev_cc = c.carrier if c else None
+
+    def scan(self, now, route, mac, cc, bssid, is_wifi, iw):
+        if not route or not route[1] or mac is None:
+            return                   # no gateway, or no complete ARP entry: never alerts
+        iface, gw = route
+        cur = {"iface": iface, "gw_ip": gw, "mac": mac, "carrier_changes": cc, "bssid": bssid}
+        if not self.loaded:
+            self.loaded = True
+            self._load(cur)
+        if self.base is not None and self.written is not None and not os.path.exists(GWJSON):
+            # the user deleted gw.json: accept the current MAC
+            self.base, self.alert, self.line, self.pending = cur, None, None, None
+            self.accepted = (f"Gateway MAC accepted {hhmm(time.time())}", now)
+            self.written = None
+            self.write()
+            return
+        b = self.base
+        if (b is None or (iface, gw) != (b["iface"], b["gw_ip"]) or cc != b["carrier_changes"]
+                or (bssid and b["bssid"] and bssid != b["bssid"])
+                or (mac.startswith(VRRP_PREFIXES) and (b["mac"] or "").startswith(VRRP_PREFIXES))):
+            self.base, self.pending = cur, None
+            if self.alert and self.alert["mismatch"]:
+                self.alert["mismatch"] = False
+                self.alert["clear_at"] = now + ALERT_HOLD
+            self.write()
+            return
+        if mac == b["mac"]:
+            self.pending = None
+            if bssid and not b["bssid"]:
+                b["bssid"] = bssid
+            if self.alert and self.alert["mismatch"]:
+                self.alert["mismatch"] = False
+                self.alert["clear_at"] = now + ALERT_HOLD
+            self.write()
+            return
+        if self.alert and self.alert["mismatch"] and self.alert["new"] == mac:
+            return                   # already alerting on this MAC
+        if self.pending is None or self.pending[0] != mac:
+            self.pending = (mac, now)
+            if is_wifi:
+                iw.pending_link = iface   # one immediate "iw dev <iface> link"
+            return
+        if is_wifi:
+            r = iw.results.get(("link", iface))
+            if not r or r.get("at", 0) <= self.pending[1]:
+                return               # wait for the fresh link result
+            fb = (r.get("data") or {}).get("bssid") if not r.get("failed") else None
+            if fb and b["bssid"] and fb != b["bssid"]:
+                return               # roamed; the next scan re-baselines on the BSSID
+        self.alert = {"since": time.time(), "old": b["mac"], "new": mac, "iface": iface,
+                      "mismatch": True, "clear_at": None}
+        self._fire_line(self.alert)
+        self.pending = None
+        self.write()
+
+    def frame_on(self, now):
+        a = self.alert
+        if not a:
+            return False
+        if a["mismatch"] or now < a["clear_at"]:
+            return True
+        self.alert = None            # hold over; the "!!" line stays
+        self.write()
+        return False
+
+
+class Uploads:
+    """F-11: per-second managed rx/tx buckets for S1 sustained upload and Up 5 min."""
+
+    def __init__(self):
+        self.rx = deque(maxlen=300)
+        self.tx = deque(maxlen=300)
+        self.sec = None
+        self.crx = self.ctx = 0
+        self.tx_sum = 0
+        self.since = None
+
+    def add(self, now, drx, dtx):
+        s = int(now)
+        if self.sec is None:
+            self.sec = s
+        if s > self.sec:
+            self.rx.append(self.crx)
+            self.tx.append(self.ctx)
+            for _ in range(min(s - self.sec - 1, 300)):
+                self.rx.append(0)
+                self.tx.append(0)
+            self.crx = self.ctx = 0
+            self.sec = s
+            srx = sum(islice(reversed(self.rx), 60))
+            stx = sum(islice(reversed(self.tx), 60))
+            if stx / 60 > 256 * 1024 and stx > srx:
+                if self.since is None:
+                    self.since = now
+            else:
+                self.since = None
+            self.tx_sum = sum(self.tx)
+        self.crx += drx
+        self.ctx += dtx
+
+    def segments(self, now):
+        out = []
+        if self.since is not None:
+            m, s = divmod(int(now - self.since) + 60, 60)
+            out.append(f"Sustained upload {m}m{s:02d}s")
+        out.append(f"Up 5 min {human(self.tx_sum + self.ctx)}")
+        return out
+
+
+class NetMonitor:
+    def __init__(self):
+        self.cache = {}
+        self.prev_t = None
+        self.abs_idx = 0
+        self.mh = {}                  # managed key -> Hist of (rx, tx) B/s
+        self.mw = {}                  # managed key -> smoothing window of (dt, drx, dtx)
+        self.monh = Hist((0.0, 0.0, 0))
+        self.monw = deque(maxlen=NET_SMOOTH)
+        self.pkt_rate = 0.0
+        self.vifs = []
+        self.mon_ended = None         # wall time the last monitor vif went away
+        self.iw = IwRunner()
+        self.gw = GwWatch()
+        self.up5 = Uploads()
+        self.route = None
+        self.gw_mac = None
+        self.wireless = {}
+        self.addrs = {}
+        self.ip_forward = 0
+        self.promisc = []
+        self.vpn = []
+
+    # ---- per tick (F-01) ----
+    def sample(self, slow):
+        try:
+            names = sorted(os.listdir(SYSNET))
+        except OSError:
+            names = []
+        cache = self.cache
+        if len(cache) != len(names) or any(n not in cache for n in names):
+            keep = set(names)
+            for n in [n for n in cache if n not in keep]:
+                del cache[n]
+        mdelta, mon, vifs = {}, [0, 0, 0], []
+        for n in names:
+            c = cache.get(n)
+            if c is None:
+                c = cache[n] = Iface(n)
+                c.check_links()
+                c.scan_attrs()
+            elif slow:
+                c.check_links()
+                c.scan_attrs()
+            if not (c.has_dev or c.has_phy):
+                c.kind = None
+                continue            # bridges, veth, tun, lo: never read per tick
+            st = f"{SYSNET}/{n}/statistics/"
+            try:
+                rx = int(rd(st + "rx_bytes"))
+                tx = int(rd(st + "tx_bytes"))
+                rxp = int(rd(st + "rx_packets"))       # every candidate, every tick (D-31)
+                t = int(rd(f"{SYSNET}/{n}/type"))      # AFTER the counters: no leak
+            except (OSError, ValueError):
+                c.prev = c.kind = None                 # vanished mid-tick: no error
+                continue
+            c.type = t
+            if t in MONITOR_TYPES:
+                kind = "monitor"
+                try:
+                    c.flags = int(rd(f"{SYSNET}/{n}/flags"), 16)
+                except (OSError, ValueError):
+                    pass
+                c.admin_up = bool(c.flags & IFF_UP)   # never operstate (D-34)
+                vifs.append(c)
+            elif c.has_dev and (t == ARPHRD_ETHER or (t == ARPHRD_NONE and WWAN_ENABLED)):
+                kind = "managed"
+            else:
+                kind = None
+            p = c.prev
+            if p is not None and kind and c.prev_kind == kind:
+                d = (max(0, rx - p[0]), max(0, tx - p[1]), max(0, rxp - p[2]))
+                if kind == "managed":
+                    mdelta[n] = d
+                else:
+                    mon[0] += d[0]
+                    mon[1] += d[1]
+                    mon[2] += d[2]
+            # else: new, kind changed or vanished -> discard the delta (rebaseline)
+            c.prev, c.prev_kind, c.kind = (rx, tx, rxp), kind, kind
+        return mdelta, mon, vifs
+
+    def advance(self, now, mdelta, mon, vifs):
+        for n, c in self.cache.items():
+            if c.kind == "managed" and n not in self.mh:
+                self.mh[n] = Hist((0.0, 0.0))
+                self.mw[n] = deque(maxlen=NET_SMOOTH)
+        if vifs and not self.vifs:
+            self.mon_ended = None
+        elif self.vifs and not vifs:
+            self.mon_ended = time.time()
+        self.vifs = vifs
+        dt = now - self.prev_t if self.prev_t is not None else None
+        self.prev_t = now
+        if not dt or dt <= 0:
+            return
+        self.abs_idx += 1
+        sdrx = sdtx = 0
+        for k in list(self.mh):
+            d = mdelta.get(k)
+            w = self.mw[k]
+            if d:
+                w.append((dt, d[0], d[1]))
+                sdrx += d[0]
+                sdtx += d[1]
+            else:
+                w.append((dt, 0, 0))   # zero-fill: down, vanished or now monitor
+            span = sum(e[0] for e in w)
+            h = self.mh[k]
+            h.append((sum(e[1] for e in w) / span, sum(e[2] for e in w) / span))
+            c = self.cache.get(k)
+            if h.nz == 0 and not (c and c.kind == "managed"):
+                del self.mh[k], self.mw[k]
+        self.up5.add(now, sdrx, sdtx)
+        w = self.monw
+        w.append((dt, mon[0], mon[1], mon[2]))
+        span = sum(e[0] for e in w)
+        state = (2 if any(c.admin_up for c in vifs) else 1) if vifs else 0
+        self.monh.append((sum(e[1] for e in w) / span, sum(e[2] for e in w) / span, state))
+        self.pkt_rate = sum(e[3] for e in w) / span
+
+    # ---- slow scan (requirements F-05, F-07, F-08, F-09, F-12, F-13) ----
+    def slow_scan(self, now):
+        try:
+            self.route = self.read_route()
+        except Exception as e:
+            log_once("route", repr(e))
+        route = self.route
+        try:
+            self.gw_mac = self.read_arp(route) if route and route[1] else None
+        except Exception as e:
+            log_once("arp", repr(e))
+        try:
+            self.wireless = self.read_wireless()
+        except FileNotFoundError:
+            self.wireless = {}     # no wireless extensions / no Wi-Fi: not an error
+        except Exception as e:
+            log_once("wireless", repr(e))
+        try:
+            self.addrs = self.read_addrs([route[0]] if route else [])
+        except Exception as e:
+            log_once("ioctl", repr(e))
+        try:
+            self.ip_forward = int(rd(IPFORWARD))
+        except Exception:
+            self.ip_forward = 0
+        try:
+            cache = self.cache
+            self.promisc = sorted(n for n, c in cache.items() if c.type == ARPHRD_ETHER
+                                  and c.has_dev and c.flags & IFF_PROMISC)
+            self.vpn = sorted(n for n, c in cache.items() if c.type == ARPHRD_NONE
+                              and not c.has_dev and c.up)
+            self.gw.route_moved(now, route, cache)
+        except Exception as e:
+            log_once("scan", repr(e))
+        try:
+            c = self.cache.get(route[0]) if route else None
+            bssid = None
+            if route and c is not None and c.has_phy:
+                bssid = self.iw.data(("link", route[0])).get("bssid")
+            self.gw.scan(now, route, self.gw_mac, c.carrier if c else None, bssid,
+                         bool(c and c.has_phy), self.iw)
+        except Exception as e:
+            log_once("scan", f"gateway watch: {e!r}")
+
+    @staticmethod
+    def read_route():
+        best = None
+        with open(f"{PROCNET}/route") as f:
+            next(f, None)
+            for line in f:
+                p = line.split()
+                if len(p) < 8 or p[1] != "00000000" or p[7] != "00000000":
+                    continue
+                fl = int(p[3], 16)
+                if not fl & RTF_UP:
+                    continue
+                metric = int(p[6])
+                if best is None or metric < best[0]:
+                    gw = socket.inet_ntoa(struct.pack("<I", int(p[2], 16))) if fl & RTF_GATEWAY else None
+                    best = (metric, p[0], gw)
+        return (best[1], best[2]) if best else None
+
+    @staticmethod
+    def read_arp(route):
+        iface, gw = route
+        with open(f"{PROCNET}/arp") as f:
+            next(f, None)
+            for line in f:
+                p = line.split()
+                if len(p) >= 6 and p[0] == gw and p[5] == iface and int(p[2], 16) & ATF_COM:
+                    return p[3].lower()
+        return None
+
+    @staticmethod
+    def read_wireless():
+        out = {}
+        with open(f"{PROCNET}/wireless") as f:
+            lines = f.read().split("\n")[2:]
+        for line in lines:
+            if ":" not in line:
+                continue
+            name, rest = line.split(":", 1)
+            try:
+                out[name.strip()] = int(float(rest.split()[2]))
+            except (IndexError, ValueError):
+                pass
+        return out
+
+    @staticmethod
+    def read_addrs(names):
+        out = {}
+        if ADDRS_FILE:
+            try:
+                with open(ADDRS_FILE) as f:
+                    for line in f:
+                        p = line.split()
+                        if len(p) >= 2:
+                            out[p[0]] = p[1]
+            except OSError:
+                pass
+            return out
+        if not names:
+            return out
+        # one short-lived socket per slow scan: the daemon keeps no extra fd open
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            for n in names:
+                try:
+                    r = fcntl.ioctl(s.fileno(), SIOCGIFADDR, struct.pack("256s", n.encode()[:15]))
+                    out[n] = socket.inet_ntoa(r[20:24])
+                except OSError:
+                    pass
+        return out
+
+    # ---- per tick driver ----
+    def tick(self, tick):
+        now = time.monotonic()
+        slow = tick % SLOW_EVERY == 0
+        mdelta, mon, vifs = self.sample(slow)
+        self.advance(now, mdelta, mon, vifs)
+        try:
+            self.iw.poll(now, tick, any(c.has_phy for c in self.cache.values()), self.link_target())
+        except Exception as e:
+            log_once("scan", f"iw runner: {e!r}")
+        if slow:
+            self.slow_scan(now)
+        try:
+            alert = self.gw.frame_on(now)
+        except Exception as e:
+            log_once("scan", f"gateway frame: {e!r}")
+            alert = False
+        return self.build(now, alert)
+
+    def link_target(self):
+        def ok(c):
+            return c is not None and c.has_phy and c.kind == "managed" and c.oper == "up"
+        if self.route and ok(self.cache.get(self.route[0])):
+            return self.route[0]
+        for n in sorted(self.cache):
+            if ok(self.cache[n]):
+                return n
+        return None
+
+    # ---- layout + tooltip ----
+    def build(self, now, alert):
+        cache = self.cache
+        active = []
+        for k in sorted(self.mh):
+            c = cache.get(k)
+            if self.mh[k].nz or (c is not None and c.kind == "managed" and c.up):
+                active.append(k)
+        mon_active = bool(self.vifs) or self.monh.nz > 0
+        slots = MAX_STRIPS - (1 if mon_active else 0)
+        groups = [[k] for k in active]
+        if len(groups) > slots:
+            groups = groups[:slots - 1] + [active[slots - 1:]]
+        managed = []      # (keys, cols [(rx, tx)])
+        for keys in groups:
+            if len(keys) == 1:
+                cols = list(self.mh[keys[0]].d)
+            else:
+                cols = [(sum(v[0] for v in col), sum(v[1] for v in col))
+                        for col in zip(*(self.mh[k].d for k in keys))]
+            managed.append((keys, cols))
+        scale = NET_FLOOR
+        for _, cols in managed:
+            for a, b in cols:
+                if a > scale:
+                    scale = a
+                if b > scale:
+                    scale = b
+        mon_cols = self.monh.d
+        mscale = NET_FLOOR
+        if mon_active:
+            for a, b, _ in mon_cols:
+                if a > mscale:
+                    mscale = a
+                if b > mscale:
+                    mscale = b
+
+        n = len(managed) + (1 if mon_active else 0)
+        empty = n == 0
+        if empty:
+            n = 1
+        H = HEIGHT - 2 if alert else HEIGHT
+        rows = strip_rows(n, H, 1 if alert else 0)
+        strips = []
+        for (keys, cols), (top, yb) in zip(managed, rows):
+            h = yb - top + 1
+            a, b = cols[-1]
+            strips.append(("managed", (vh(a, scale, h), vh(b, scale, h)),
+                           tuple((vh(x, scale, h), vh(y, scale, h)) for x, y in cols), None))
+        if mon_active:
+            top, yb = rows[-1]
+            h = yb - top + 1
+            a, b, _ = mon_cols[-1]
+            base_idx = self.abs_idx - (HISTORY - 1)
+            lit = tuple(st == 2 or (st == 1 and (base_idx + i) % 2 == 0)
+                        for i, (_, _, st) in enumerate(mon_cols))
+            strips.append(("monitor", (vh(a, mscale, h), vh(b, mscale, h)),
+                           tuple((vh(x, mscale, h), vh(y, mscale, h)) for x, y, _ in mon_cols),
+                           lit))
+        if empty:
+            strips.append(("managed", (0, 0), ((0, 0),) * HISTORY, None))
+        layout = (alert, tuple(strips))
+        return layout, self.tooltip(now, managed, scale, mon_active, mscale)
+
+    def wifi_details(self, name, now):
+        keys = [("dev",)]
+        if ("link", name) in self.iw.results:
+            keys.append(("link", name))
+        st = self.iw.status(keys, now)
+        if st and st[0] == "unavailable":
+            return f"Wi-Fi details unavailable ({esc(st[1])})"
+        dev = self.iw.data(("dev",)).get(name, {})
+        link = self.iw.data(("link", name))
+        segs = []
+        ssid = dev.get("ssid") or link.get("ssid")
+        if ssid:
+            segs.append(esc(ssid))
+        sig = self.wireless.get(name, link.get("signal"))
+        if sig is not None:
+            segs.append(f"{sig} dBm")
+        if dev.get("chan"):
+            segs.append(f"ch{dev['chan']} {dev['freq']} MHz" + (f"/{dev['width']}" if dev.get("width") else ""))
+        br = []
+        if link.get("rx") is not None:
+            br.append(f"rx {round(link['rx'])}")
+        if link.get("tx") is not None:
+            br.append(f"tx {round(link['tx'])}")
+        if br:
+            segs.append(" " + "/".join(br) + " Mbit/s")
+        if st:
+            segs.append(f"(stale {int(st[1])}s)")
+        return " ".join(segs)
+
+    def iface_flag(self, name):
+        t = self.iw.data(("dev",)).get(name, {}).get("type")
+        return {"AP": "[AP]", "P2P-GO": "[AP]", "mesh point": "[mesh]", "IBSS": "[IBSS]"}.get(t)
+
+    def tooltip(self, now, managed, scale, mon_active, mscale):
+        cache, route = self.cache, self.route
+        rate = lambda a, b: f"↓ {human(a, 'B/s')} ↑ {human(b, 'B/s')}"
+        lines = []
+
+        # L1
+        l1 = []
+        if self.gw.line:
+            l1.append(f"<b>{esc(self.gw.line)}</b>")
+        elif self.gw.accepted and now - self.gw.accepted[1] < NOTE_TIME:
+            l1.append(esc(self.gw.accepted[0]))
+        if self.gw.moved and now - self.gw.moved[1] < NOTE_TIME:
+            l1.append(esc(self.gw.moved[0]))
+        if l1:
+            lines.append(" | ".join(l1))
+
+        # L2
+        trx = sum(h.d[-1][0] for h in self.mh.values())
+        ttx = sum(h.d[-1][1] for h in self.mh.values())
+        physical = any(c.has_dev or c.has_phy for c in cache.values())
+        if managed:
+            lines.append(f"{glyph(HEX['down'])}{glyph(HEX['up'])} Total {rate(trx, ttx)}"
+                         f"   Scale {human(scale, 'B/s')}")
+        elif mon_active:
+            lines.append("No managed link (capture only)")
+        elif physical:
+            lines.append("No managed interface up")
+        else:
+            lines.append("No network interfaces")
+
+        # L3-L5 strips
+        n = len(managed) + (1 if mon_active else 0)
+        labels = {2: ("top", "bottom"), 3: ("top", "mid", "bottom")}.get(n, ("",))
+        default_if = route[0] if route else None
+        for (keys, cols), label in zip(managed, labels):
+            a, b = cols[-1]
+            pre = f"{label}  " if label else ""
+            if len(keys) > 1:
+                lines.append(f"{pre}other: {esc('+'.join(keys))}  {rate(a, b)}")
+                continue
+            k = keys[0]
+            c = cache.get(k)
+            parts = [esc(k)]
+            flag = self.iface_flag(k) if c is not None and c.has_phy else None
+            if flag:
+                parts.append(flag)
+            if k == default_if:
+                parts.append("★")
+            if not (c is not None and c.kind == "managed" and c.up):
+                parts.append("(down)")
+            elif c.has_phy:
+                det = self.wifi_details(k, now)
+                if det:
+                    parts.append(det)
+            lines.append(f"{pre}{' '.join(parts)}  {rate(a, b)}")
+        if mon_active:
+            pre = f"{labels[-1]}  " if n > 1 else ""
+            if self.vifs:
+                devd = self.iw.data(("dev",))
+                groups = []
+                for c in sorted(self.vifs, key=lambda c: c.name):
+                    d = devd.get(c.name, {})
+                    ch = f", ch{d['chan']} {d['freq']} MHz" if d.get("chan") else ""
+                    groups.append(f"{esc(c.name)} ({esc(c.phy or '?')}{ch}, "
+                                  f"{'up' if c.admin_up else 'down'})")
+                mrx, mtx, _ = self.monh.d[-1]
+                pr = self.pkt_rate
+                fr = f"{pr:.0f} fr/s" if pr < 1000 else f"{pr / 1000:.1f}k fr/s"
+                lines.append(f"{pre}{glyph(HEX['mrx'])} MONITOR {' + '.join(groups)}  "
+                             f"{glyph(HEX['mrx'])} captured {human(mrx, 'B/s')}  "
+                             f"{glyph(HEX['mtx'])} injected {human(mtx, 'B/s')}  "
+                             f"{fr} · not in total · Mon scale {human(mscale, 'B/s')}")
+            else:
+                ended = hhmm(self.mon_ended, "%H:%M:%S") if self.mon_ended else "?"
+                lines.append(f"{pre}monitor ended {ended}")
+
+        # L6 gateway
+        if route:
+            iface, gw = route
+            lines.append(f"Gateway {esc(gw or '?')} {esc(self.gw_mac or '?')} via {esc(iface)}, "
+                         f"IP {esc(self.addrs.get(iface, '?'))}")
+        else:
+            lines.append("No default route")
+
+        # L7 promisc
+        if self.promisc:
+            lines.append(f"PROMISC {esc(', '.join(self.promisc))} (packet capture running)")
+
+        # L8
+        segs = []
+        if self.vpn:
+            segs.append(f"VPN {esc(', '.join(self.vpn))} up")
+        segs += self.up5.segments(now)
+        if segs:
+            lines.append(" · ".join(segs))
+
+        # L9 forwarding (F-13)
+        if self.ip_forward == 1:
+            up = sorted(k for k, c in cache.items() if c.kind == "managed" and c.type == ARPHRD_ETHER
+                        and c.has_dev and c.oper == "up")
+            if len(up) >= 2:
+                lines.append(f"Forwarding on: traffic routed between {esc(up[0])} and {esc(up[1])} "
+                             f"is counted on both")
+
+        # L10 idle
+        shown = {k for keys, _ in managed for k in keys}
+        idle = []
+        for k in sorted(cache):
+            c = cache[k]
+            if c.kind != "managed" or k in shown:
+                continue
+            if not c.flags & IFF_UP:
+                word = "down"
+            else:
+                word = "not connected" if c.has_phy else "no carrier"
+            idle.append(f"{esc(k)} {word}")
+        if idle:
+            lines.append("Idle: " + " · ".join(idle))
+        return "\n".join(lines)
+
+
+def run(lock):
+    mem = Graph("mem")
+    net = NetGraph("net")
+    netmon = NetMonitor()
+    mem_hist = deque(maxlen=HISTORY)
+    tick = 0
+
+    # idle detection on the monotonic clock: wall-clock jumps and suspend
+    # must not look like "nobody has called us for 30 s"
+    open(SEEN, "a").close()
+    seen_mtime = os.stat(SEEN).st_mtime_ns
+    seen_at = time.monotonic()
+
+    try:
+        while True:
+            start = time.monotonic()
+            # two stats per tick; checked before anything is written so a
+            # replaced owner never touches the new owner's files
+            if lost_lock(lock):
+                return
+            if tick % SLOW_EVERY == 0:  # every ~5 s
+                try:
+                    ensure_pidfile()
+                except OSError:
+                    log_error(traceback.format_exc())
+
+            # each graph fails and backs off on its own, so one can't freeze the other
+            if start >= mem.retry_at:
+                try:
+                    m = read_meminfo()
+                    total, avail = m["MemTotal"], m["MemAvailable"]
+                    used = total - avail
+                    mem_hist.append(used / total)
+                    swap_used = m["SwapTotal"] - m["SwapFree"]
+                    mem.update([(mem_hist, None)],
+                               [(used / total, BARS)],
+                               f"RAM: {human(used)} / {human(total)} ({100 * used / total:.0f}%)\n"
+                               f"Swap: {human(swap_used)} / {human(m['SwapTotal'])}")
+                except Exception as e:
+                    mem.fail(e)
+
+            if start >= net.retry_at:
+                try:
+                    layout, markup = netmon.tick(tick)
+                    net.update(layout, markup)
+                except Exception as e:
+                    net.fail(e)
+
+            tick += 1
+            try:
+                mtime = os.stat(SEEN).st_mtime_ns
+            except OSError:
+                mtime = None
+            if mtime != seen_mtime:
+                seen_mtime, seen_at = mtime, time.monotonic()
+            elif time.monotonic() - seen_at > IDLE_EXIT:
+                return
+            time.sleep(max(0.0, INTERVAL - (time.monotonic() - start)))
+    finally:
+        netmon.iw.kill()
+
+
+def main():
+    # genmon waits for EOF on every pipe its command holds; drop the copies we
+    # inherited from panelgraph-show or the panel item that launched us freezes.
+    os.closerange(3, os.sysconf("SC_OPEN_MAX"))
+    locked = False
+    try:
+        os.makedirs(DIR, exist_ok=True)
+        # panelgraph-show checks /proc/<pid>/cwd against DIR, so a pid file
+        # pointing at a "panelgraph" serving another runtime dir isn't trusted
+        os.chdir(DIR)
+        lock = open(LOCK, "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # another instance is already running
+        locked = True
+
+        with open("/proc/self/comm", "w") as f:
+            f.write(PROC_NAME)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        write_atomic(PIDFILE, str(os.getpid()))
+        run(lock)
+    except Exception as e:
+        log_error(traceback.format_exc())
+        # Only linger while holding the lock: panelgraph-show doesn't start a
+        # daemon while the lock is taken, so holding it stops the respawns.
+        # Without it, lingering would just pile up sleeping copies.
+        if locked:
+            for name in ("mem", "net"):
+                show_error(name, e)
+            time.sleep(FATAL_HOLD)
+        return 1
+    finally:
+        if locked:
+            try:
+                with open(PIDFILE) as f:
+                    if f.read().strip() == str(os.getpid()):
+                        os.unlink(PIDFILE)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
