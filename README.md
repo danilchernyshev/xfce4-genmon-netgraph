@@ -42,7 +42,7 @@ root and no packet capture, and only reads `/sys` and `/proc`.
 ```bash
 sudo apt install xfce4-genmon-plugin python3-cairo iw xfce4-taskmanager
 
-git clone git@github.com:danilchernyshev/xfce4-genmon-netgraph.git
+git clone https://github.com/danilchernyshev/xfce4-genmon-netgraph.git
 cd xfce4-genmon-netgraph
 ./install.sh            # copies bin/panelgraph-daemon and bin/panelgraph-show to ~/.local/bin
 ```
